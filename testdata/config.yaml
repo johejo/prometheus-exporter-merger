@@ -1,0 +1,20 @@
+default:
+  address: ":8080"
+  path: "/metrics"
+  exporters:
+    node_exporter0:
+      uri: http://localhost:9100/metrics
+      labels:
+        job: node-exporter0
+    node_exporter1:
+      uri: http://localhost:9100/metrics
+      labels:
+        job: node-exporter1
+#   process-exporter:
+#     uri: http://localhost:9256/metrics
+#     labels:
+#       job: process-exporter
+#   exporter-merger:
+#     uri: http://localhost:9716/metrics
+#     labels:
+#       job: exporter-merger
