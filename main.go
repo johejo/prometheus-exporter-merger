@@ -55,7 +55,7 @@ func main() {
 	}
 	wg.Add(1)
 	go func() {
-		slog.Info("listening selft metrics", "address", *selfMetricsAddress)
+		slog.Info("listening self metrics", "address", *selfMetricsAddress)
 		mux := http.NewServeMux()
 		metrics.ExposeMetadata(*selfMetricsExposeMetdata)
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +165,7 @@ func handler(exporters map[string]Exporter) http.HandlerFunc {
 			for name, e := range exporters {
 				go func() {
 					defer wg.Done()
-					slog.Info("start fetching", "name", name, "uri", e.URI)
+					slog.Debug("start fetching", "name", name, "uri", e.URI)
 					req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.URI, nil)
 					if err != nil {
 						slog.Error(err.Error())
