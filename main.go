@@ -71,9 +71,10 @@ func main() {
 type Config map[string]ListenerConfig
 
 type ListenerConfig struct {
-	Address   string              `json:"address" yaml:"address"`
-	Path      string              `json:"path" yaml:"path"`
-	Exporters map[string]Exporter `json:"exporters" yaml:"exporters"`
+	Address      string              `json:"address" yaml:"address"`
+	Path         string              `json:"path" yaml:"path"`
+	Exporters    map[string]Exporter `json:"exporters" yaml:"exporters"`
+	CommonLabels map[string]string   `json:"commonLabels" yaml:"commonLabels"`
 }
 
 type Exporter struct {
@@ -143,12 +144,18 @@ func loadConfig(config string, expandEnv bool) (*Config, error) {
 
 func serve(cfg ListenerConfig) error {
 	mux := http.NewServeMux()
-	mux.Handle(cfg.Path, http.HandlerFunc(handler(cfg.Exporters)))
+	mux.Handle(cfg.Path, handler(cfg))
 	return http.ListenAndServe(cfg.Address, gzhttp.GzipHandler(mux))
 }
 
-func handler(exporters map[string]Exporter) http.HandlerFunc {
-	transformers := makeTrasformers(exporters)
+func handler(cfg ListenerConfig) http.HandlerFunc {
+	transformers := make(map[string]transform.Transformer)
+	for name, e := range cfg.Exporters {
+		transformers[name] = transformer(append(
+			mapToSliceLabels(e.Labels),
+			mapToSliceLabels(cfg.CommonLabels)...,
+		))
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -156,13 +163,13 @@ func handler(exporters map[string]Exporter) http.HandlerFunc {
 			Name string
 			Body io.ReadCloser
 		}
-		payload := make(chan *Payload, len(exporters))
+		payload := make(chan *Payload, len(cfg.Exporters))
 
 		go func() {
 			defer close(payload)
 			var wg sync.WaitGroup
-			wg.Add(len(exporters))
-			for name, e := range exporters {
+			wg.Add(len(cfg.Exporters))
+			for name, e := range cfg.Exporters {
 				go func() {
 					defer wg.Done()
 					slog.Debug("start fetching", "name", name, "uri", e.URI)
@@ -194,21 +201,17 @@ func handler(exporters map[string]Exporter) http.HandlerFunc {
 	}
 }
 
+func mapToSliceLabels(m map[string]string) []string {
+	s := make([]string, 0, len(m))
+	for k, v := range m {
+		s = append(s, fmt.Sprintf(`%s="%s"`, k, v))
+	}
+	return s
+}
+
 var (
 	metricRegex = regexp.MustCompile(`\n(?<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?<labels>\{[^\}].*\})?\s(?<sample>[0-9eE\.\+\-]+)`)
 )
-
-func makeTrasformers(exporters map[string]Exporter) map[string]transform.Transformer {
-	transformers := make(map[string]transform.Transformer)
-	for name, e := range exporters {
-		var labels []string
-		for k, v := range e.Labels {
-			labels = append(labels, fmt.Sprintf(`%s="%s"`, k, v))
-		}
-		transformers[name] = transformer(labels)
-	}
-	return transformers
-}
 
 func transformer(labels []string) transform.Transformer {
 	return replace.RegexpStringSubmatchFunc(metricRegex, mergeLabels(labels))

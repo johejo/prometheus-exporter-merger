@@ -1,6 +1,8 @@
 default:
   address: ":8080"
   path: "/metrics"
+  commonLabels:
+    machine: foo
   exporters:
     node_exporter0:
       uri: http://localhost:9100/metrics

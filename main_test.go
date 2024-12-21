@@ -20,7 +20,7 @@ func Test(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h := handler((*cfg)["default"].Exporters)
+	h := handler((*cfg)["default"])
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	h.ServeHTTP(rec, req)
 
