@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/CAFxX/httpcompression"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goccy/go-yaml"
 	"github.com/icholy/replace"
@@ -145,7 +146,11 @@ func loadConfig(config string, expandEnv bool) (*Config, error) {
 func serve(cfg ListenerConfig) error {
 	mux := http.NewServeMux()
 	mux.Handle(cfg.Path, handler(cfg))
-	return http.ListenAndServe(cfg.Address, gzhttp.GzipHandler(mux))
+	compress, err := httpcompression.DefaultAdapter()
+	if err != nil {
+		return err
+	}
+	return http.ListenAndServe(cfg.Address, compress(mux))
 }
 
 func handler(cfg ListenerConfig) http.HandlerFunc {
