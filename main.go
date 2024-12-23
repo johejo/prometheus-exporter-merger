@@ -223,18 +223,18 @@ func transformer(labels []string) transform.Transformer {
 }
 
 func mergeLabels(kv []string) func(s []string) string {
+	kvs := strings.Join(kv, ",")
 	return func(s []string) string {
 		name := s[1]
 		labels := s[2]
 		sample := s[3]
-		slog.Debug("parsing series", "name", name, "labels", labels, "sample", sample)
-		if labels == "" && len(kv) == 0 {
+		if labels == "" && kvs == "" {
 			return "\n" + name + " " + sample
 		}
 		if labels == "" {
-			labels = "{" + strings.Join(kv, ",") + "}"
+			labels = "{" + kvs + "}"
 		} else {
-			labels = strings.TrimSuffix(labels, "}") + "," + strings.Join(kv, ",") + "}"
+			labels = strings.TrimSuffix(labels, "}") + "," + kvs + "}"
 		}
 		return "\n" + name + labels + " " + sample
 	}
