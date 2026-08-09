@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,7 +22,7 @@ import (
 )
 
 var (
-	httpClient               = sync.OnceValue(initHTTPClient)
+	httpClient               = func() *http.Client { return http.DefaultClient }
 	logLevel                 = flag.String("log-level", "info", "logging level: debug, info, warn, error")
 	config                   = flag.String("config", "config.yaml", "configuration file path")
 	expandEnv                = flag.Bool("expand-env", false, "expand environment variables in config")
@@ -109,10 +110,6 @@ func initLogger(loglevel string) {
 	)))
 }
 
-func initHTTPClient() *http.Client {
-	return &http.Client{}
-}
-
 func loadConfig(config string, expandEnv bool) (*Config, error) {
 	b, err := os.ReadFile(config)
 	if err != nil {
@@ -146,32 +143,48 @@ func serve(cfg ListenerConfig) error {
 	return http.ListenAndServe(cfg.Address, mux)
 }
 
+// target is an exporter resolved against its listener's configuration, with the
+// labels to splice into its samples precomputed once at handler construction.
+type target struct {
+	name  string
+	uri   string
+	extra []byte
+}
+
+// payload is a fetched exporter response on its way to the merged output. The
+// receiver owns body and is responsible for closing it.
+type payload struct {
+	extra []byte
+	body  io.ReadCloser
+}
+
 func handler(cfg ListenerConfig) http.HandlerFunc {
-	extraLabels := make(map[string][]byte, len(cfg.Exporters))
+	targets := make([]target, 0, len(cfg.Exporters))
 	for name, e := range cfg.Exporters {
-		extraLabels[name] = []byte(strings.Join(append(
-			mapToSliceLabels(e.Labels),
-			mapToSliceLabels(cfg.CommonLabels)...,
-		), ","))
+		targets = append(targets, target{
+			name: name,
+			uri:  e.URI,
+			extra: []byte(strings.Join(append(
+				mapToSliceLabels(e.Labels),
+				mapToSliceLabels(cfg.CommonLabels)...,
+			), ",")),
+		})
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
 
-		type payload struct {
-			extra []byte
-			body  io.ReadCloser
-		}
-		payloads := make(chan *payload, len(cfg.Exporters))
+		payloads := make(chan payload, len(targets))
 
 		go func() {
 			defer close(payloads)
 			var wg sync.WaitGroup
-			wg.Add(len(cfg.Exporters))
-			for name, e := range cfg.Exporters {
+			wg.Add(len(targets))
+			for _, t := range targets {
 				go func() {
 					defer wg.Done()
-					slog.Debug("start fetching", "name", name, "uri", e.URI)
-					req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.URI, nil)
+					slog.Debug("start fetching", "name", t.name, "uri", t.uri)
+					req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.uri, nil)
 					if err != nil {
 						slog.Error(err.Error())
 						return
@@ -181,21 +194,33 @@ func handler(cfg ListenerConfig) http.HandlerFunc {
 						slog.Error(err.Error())
 						return
 					}
-					slog.Debug("finish fetching", "name", name)
-					payloads <- &payload{extra: extraLabels[name], body: resp.Body}
+					slog.Debug("finish fetching", "name", t.name)
+					select {
+					case payloads <- payload{extra: t.extra, body: resp.Body}:
+					case <-ctx.Done():
+						resp.Body.Close() // the hand-off failed, so ownership never transferred
+					}
 				}()
 			}
 			wg.Wait()
 		}()
 
 		bw := bufio.NewWriter(w)
+		var copyErr error
 		for p := range payloads {
-			slog.Debug("start copying body with merging labels")
-			if err := copyBody(bw, p.body, p.extra); err != nil {
-				slog.Error(err.Error())
-				return
+			if copyErr == nil {
+				slog.Debug("start copying body with merging labels")
+				if copyErr = copyBody(bw, p.body, p.extra); copyErr != nil {
+					slog.Error(copyErr.Error())
+					cancel() // stop in-flight fetches; whatever is already on its way is drained here
+				} else {
+					slog.Debug("finish copying body")
+				}
 			}
-			slog.Debug("finish copying body")
+			p.body.Close()
+		}
+		if copyErr != nil {
+			return
 		}
 		if err := bw.Flush(); err != nil {
 			slog.Error(err.Error())
@@ -203,49 +228,67 @@ func handler(cfg ListenerConfig) http.HandlerFunc {
 	}
 }
 
+var labelValueEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	"\n", `\n`,
+	`"`, `\"`,
+)
+
 func mapToSliceLabels(m map[string]string) []string {
 	s := make([]string, 0, len(m))
 	for k, v := range m {
-		s = append(s, fmt.Sprintf(`%s="%s"`, k, escapeLabelValue(v)))
+		s = append(s, fmt.Sprintf(`%s="%s"`, k, labelValueEscaper.Replace(v)))
 	}
 	slices.Sort(s) // map iteration order would make the output unstable
 	return s
 }
 
-func escapeLabelValue(v string) string {
-	return strings.NewReplacer(
-		`\`, `\\`,
-		"\n", `\n`,
-		`"`, `\"`,
-	).Replace(v)
-}
+// readBufferSize is large enough that a whole exposition line practically always
+// fits, which keeps copyBody on its zero-copy path.
+const readBufferSize = 64 << 10
 
-func copyBody(w *bufio.Writer, body io.ReadCloser, extraLabels []byte) error {
-	defer body.Close()
+// copyBody streams body to w, splicing extraLabels into every sample line. It
+// does not close body; the caller owns it.
+func copyBody(w *bufio.Writer, body io.Reader, extraLabels []byte) error {
+	if len(extraLabels) == 0 {
+		_, err := io.Copy(w, body)
+		return err
+	}
 
-	r := bufio.NewReader(body)
+	r := bufio.NewReaderSize(body, readBufferSize)
+	// ReadSlice returns a view into r's buffer, so no per-line allocation. Only a
+	// line too long to fit gets assembled into joined, which is reused after that.
+	var joined []byte
 	for {
-		line, err := r.ReadBytes('\n')
+		line, err := r.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			joined = append(joined[:0], line...)
+			for err == bufio.ErrBufferFull {
+				line, err = r.ReadSlice('\n')
+				joined = append(joined, line...)
+			}
+			line = joined
+		}
 		if len(line) > 0 {
-			if writeErr := writeLine(w, line, extraLabels); writeErr != nil {
-				return writeErr
+			if err := writeLine(w, line, extraLabels); err != nil {
+				return err
 			}
 		}
-		if err == io.EOF {
-			return nil
-		}
 		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
 			return err
 		}
 	}
 }
 
-// writeLine copies line to w, splicing extraLabels into its label set when the
-// line is a sample. Everything else - comments, blank lines, anything that does
-// not parse - is passed through untouched.
+// writeLine copies line to w, splicing the non-empty extraLabels into its label
+// set when the line is a sample. Everything else - comments, blank lines,
+// anything that does not parse - is passed through untouched.
 func writeLine(w *bufio.Writer, line, extraLabels []byte) error {
 	at, prefix, suffix, ok := labelInsertPoint(line)
-	if len(extraLabels) == 0 || !ok {
+	if !ok {
 		_, err := w.Write(line)
 		return err
 	}
@@ -266,34 +309,38 @@ func writeLine(w *bufio.Writer, line, extraLabels []byte) error {
 func labelInsertPoint(line []byte) (at int, prefix, suffix string, ok bool) {
 	nameEnd := metricNameEnd(line)
 	if nameEnd == 0 || nameEnd == len(line) {
-		return
+		return 0, "", "", false
 	}
 
 	switch line[nameEnd] {
 	case ' ', '\t':
 		if !hasSampleValue(line, nameEnd) {
-			return
+			return 0, "", "", false
 		}
 		return nameEnd, "{", "}", true
 	case '{':
 		labelsEnd := labelSetEnd(line, nameEnd)
-		if labelsEnd < 0 || labelsEnd+1 >= len(line) || (line[labelsEnd+1] != ' ' && line[labelsEnd+1] != '\t') {
-			return
-		}
-		if !hasSampleValue(line, labelsEnd+1) {
-			return
+		if labelsEnd < 0 || !hasSampleValue(line, labelsEnd+1) {
+			return 0, "", "", false
 		}
 		if len(bytes.TrimSpace(line[nameEnd+1:labelsEnd])) > 0 {
 			prefix = ","
 		}
 		return labelsEnd, prefix, "", true
 	default:
-		return
+		return 0, "", "", false
 	}
 }
 
+// hasSampleValue reports whether a numeric sample value follows valueStart,
+// which must be the offset of the whitespace separating the value from the
+// metric name or label set.
 func hasSampleValue(line []byte, valueStart int) bool {
-	value := bytes.TrimLeft(line[valueStart:], " \t")
+	rest := line[valueStart:]
+	if len(rest) == 0 || (rest[0] != ' ' && rest[0] != '\t') {
+		return false
+	}
+	value := bytes.TrimLeft(rest, " \t")
 	if i := bytes.IndexAny(value, " \t\r\n"); i >= 0 {
 		value = value[:i]
 	}

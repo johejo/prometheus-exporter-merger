@@ -3,12 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
 )
 
 func TestHandler(t *testing.T) {
@@ -29,7 +33,7 @@ func TestHandler(t *testing.T) {
 	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 
-	if want, got := 4, countLines(t, strings.NewReader(body)); want != got {
+	if want, got := 4, countLines(body); want != got {
 		t.Errorf("line count should be same as upstream exporters: want=%d, got=%d", want, got)
 	}
 	if want, got := 2, strings.Count(body, `metric{foo="bar"} 1`); want != got {
@@ -37,13 +41,67 @@ func TestHandler(t *testing.T) {
 	}
 }
 
-func countLines(t *testing.T, r io.Reader) int {
-	b, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
+func TestHandlerClosesAllResponseBodiesAfterCopyError(t *testing.T) {
+	readErr := errors.New("read failed")
+	bodies := map[string]*trackingReadCloser{
+		"first":  {Reader: iotest.ErrReader(readErr)},
+		"second": {Reader: iotest.ErrReader(readErr)},
 	}
+
+	// Hold every response until all of them are in flight, so the copy of the
+	// first one fails while the others are still unclaimed.
+	var arrived sync.WaitGroup
+	arrived.Add(len(bodies))
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		arrived.Done()
+		arrived.Wait()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       bodies[req.URL.Host],
+			Request:    req,
+		}, nil
+	})
+
+	originalHTTPClient := httpClient
+	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
+	t.Cleanup(func() { httpClient = originalHTTPClient })
+
+	cfg := ListenerConfig{
+		Path: "/metrics",
+		Exporters: map[string]Exporter{
+			"first":  {URI: "http://first"},
+			"second": {URI: "http://second"},
+		},
+	}
+	handler(cfg).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	for name, body := range bodies {
+		if !body.closed.Load() {
+			t.Errorf("response body for %s was not closed", name)
+		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type trackingReadCloser struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+func countLines(s string) int {
 	n := 0
-	for _, line := range bytes.Split(b, []byte("\n")) {
+	for _, line := range strings.Split(s, "\n") {
 		if len(line) != 0 {
 			n++
 		}
@@ -69,7 +127,7 @@ func Test_mapToSliceLabelsEscapesValues(t *testing.T) {
 }
 
 func Test_copyBody(t *testing.T) {
-	longValue := strings.Repeat("x", 4*1024) // longer than bufio's default read buffer
+	longValue := strings.Repeat("x", 2*readBufferSize) // forces the read buffer to overflow
 	exposition := strings.Join([]string{
 		`# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.`,
 		`# TYPE go_gc_duration_seconds summary`,
@@ -96,23 +154,26 @@ func Test_copyBody(t *testing.T) {
 	}, "\n")
 
 	tests := []struct {
-		name   string
-		origin string
-		want   string
+		name        string
+		origin      string
+		extraLabels string
+		want        string
 	}{
-		{name: "exposition", origin: exposition, want: expositionWant},
+		{name: "exposition", origin: exposition, extraLabels: `foo="bar"`, want: expositionWant},
 		{
-			name:   "line longer than the read buffer",
-			origin: fmt.Sprintf("metric{value=%q} 1\n", longValue),
-			want:   fmt.Sprintf("metric{value=%q,foo=\"bar\"} 1\n", longValue),
+			name:        "line longer than the read buffer",
+			origin:      fmt.Sprintf("metric{value=%q} 1\n", longValue),
+			extraLabels: `foo="bar"`,
+			want:        fmt.Sprintf("metric{value=%q,foo=\"bar\"} 1\n", longValue),
 		},
+		{name: "no extra labels", origin: exposition, want: exposition},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			w := bufio.NewWriter(&buf)
-			if err := copyBody(w, io.NopCloser(strings.NewReader(tt.origin)), []byte(`foo="bar"`)); err != nil {
+			if err := copyBody(w, strings.NewReader(tt.origin), []byte(tt.extraLabels)); err != nil {
 				t.Fatal(err)
 			}
 			if err := w.Flush(); err != nil {
@@ -160,13 +221,6 @@ func Test_writeLine(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("no extra labels", func(t *testing.T) {
-		const line = "metric 1\n"
-		if got := string(writeLineOutput([]byte(line), nil)); got != line {
-			t.Errorf("want %q, got %q", line, got)
-		}
-	})
 }
 
 func Fuzz_writeLine(f *testing.F) {
