@@ -6,7 +6,6 @@ require (
 	github.com/VictoriaMetrics/metrics v1.35.1
 	github.com/goccy/go-yaml v1.15.12
 	github.com/icholy/replace v0.6.0
-	github.com/klauspost/compress v1.17.11
 	golang.org/x/text v0.21.0
 )
 

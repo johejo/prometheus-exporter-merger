@@ -16,7 +16,6 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goccy/go-yaml"
 	"github.com/icholy/replace"
-	"github.com/klauspost/compress/gzhttp"
 	"golang.org/x/text/transform"
 )
 
@@ -61,7 +60,7 @@ func main() {
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 			metrics.WriteProcessMetrics(w)
 		})
-		if err := http.ListenAndServe(*selfMetricsAddress, gzhttp.GzipHandler(mux)); err != nil {
+		if err := http.ListenAndServe(*selfMetricsAddress, mux); err != nil {
 			slog.Error(err.Error())
 		}
 	}()
@@ -110,9 +109,7 @@ func initLogger(loglevel string) {
 }
 
 func initHTTPClient() *http.Client {
-	return &http.Client{
-		Transport: gzhttp.Transport(http.DefaultTransport),
-	}
+	return &http.Client{}
 }
 
 func loadConfig(config string, expandEnv bool) (*Config, error) {
