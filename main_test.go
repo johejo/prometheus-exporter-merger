@@ -51,6 +51,23 @@ func countLines(t *testing.T, r io.Reader) int {
 	return n
 }
 
+func Test_mapToSliceLabelsEscapesValues(t *testing.T) {
+	labels := mapToSliceLabels(map[string]string{
+		"special": "quote \" backslash \\ newline\n",
+	})
+	if len(labels) != 1 {
+		t.Fatalf("want one label, got %d", len(labels))
+	}
+	if want, got := `special="quote \" backslash \\ newline\n"`, labels[0]; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+
+	line := []byte("metric{" + labels[0] + "} 1\n")
+	if _, _, _, ok := labelInsertPoint(line); !ok {
+		t.Errorf("generated label cannot be parsed: %q", line)
+	}
+}
+
 func Test_copyBody(t *testing.T) {
 	longValue := strings.Repeat("x", 4*1024) // longer than bufio's default read buffer
 	exposition := strings.Join([]string{

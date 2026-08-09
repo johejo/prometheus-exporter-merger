@@ -206,10 +206,18 @@ func handler(cfg ListenerConfig) http.HandlerFunc {
 func mapToSliceLabels(m map[string]string) []string {
 	s := make([]string, 0, len(m))
 	for k, v := range m {
-		s = append(s, fmt.Sprintf(`%s="%s"`, k, v))
+		s = append(s, fmt.Sprintf(`%s="%s"`, k, escapeLabelValue(v)))
 	}
 	slices.Sort(s) // map iteration order would make the output unstable
 	return s
+}
+
+func escapeLabelValue(v string) string {
+	return strings.NewReplacer(
+		`\`, `\\`,
+		"\n", `\n`,
+		`"`, `\"`,
+	).Replace(v)
 }
 
 func copyBody(w *bufio.Writer, body io.ReadCloser, extraLabels []byte) error {
