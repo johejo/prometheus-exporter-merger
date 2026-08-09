@@ -5,8 +5,6 @@ go 1.23
 require (
 	github.com/VictoriaMetrics/metrics v1.35.1
 	github.com/goccy/go-yaml v1.15.12
-	github.com/icholy/replace v0.6.0
-	golang.org/x/text v0.21.0
 )
 
 require (

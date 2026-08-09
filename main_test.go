@@ -1,39 +1,39 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"golang.org/x/text/transform"
 )
 
-func Test(t *testing.T) {
-	t.Log("this test depends on node_exporter on localhost:9100")
+func TestHandler(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "# HELP metric documentation\nmetric 1\n")
+	}))
+	defer upstream.Close()
 
-	cfg, err := loadConfig("./testdata/config.yaml", false)
-	if err != nil {
-		t.Fatal(err)
+	cfg := ListenerConfig{
+		Path: "/metrics",
+		Exporters: map[string]Exporter{
+			"first":  {URI: upstream.URL},
+			"second": {URI: upstream.URL},
+		},
+		CommonLabels: map[string]string{"foo": "bar"},
 	}
-
 	rec := httptest.NewRecorder()
-	h := handler((*cfg)["default"])
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	h.ServeHTTP(rec, req)
+	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
 
-	nodeExpResp, err := http.Get("http://localhost:9100/metrics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer nodeExpResp.Body.Close()
-
-	want := countLines(t, nodeExpResp.Body) * 2 // proxy to node_exporter twice in config.yaml
-	got := countLines(t, rec.Body)
-	if want != got {
+	if want, got := 4, countLines(t, strings.NewReader(body)); want != got {
 		t.Errorf("line count should be same as upstream exporters: want=%d, got=%d", want, got)
+	}
+	if want, got := 2, strings.Count(body, `metric{foo="bar"} 1`); want != got {
+		t.Errorf("all samples should contain common labels: want=%d, got=%d", want, got)
 	}
 }
 
@@ -51,8 +51,9 @@ func countLines(t *testing.T, r io.Reader) int {
 	return n
 }
 
-func Test_transformer(t *testing.T) {
-	origin := strings.Join([]string{
+func Test_copyBody(t *testing.T) {
+	longValue := strings.Repeat("x", 4*1024) // longer than bufio's default read buffer
+	exposition := strings.Join([]string{
 		`# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.`,
 		`# TYPE go_gc_duration_seconds summary`,
 		`go_gc_duration_seconds{quantile="0"} 5.871e-06`,
@@ -64,7 +65,7 @@ func Test_transformer(t *testing.T) {
 		`go_gc_duration_seconds_sum 0.464658525`,
 		`go_gc_duration_seconds_count 30719`,
 	}, "\n")
-	want := strings.Join([]string{
+	expositionWant := strings.Join([]string{
 		`# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.`,
 		`# TYPE go_gc_duration_seconds summary`,
 		`go_gc_duration_seconds{quantile="0",foo="bar"} 5.871e-06`,
@@ -76,13 +77,112 @@ func Test_transformer(t *testing.T) {
 		`go_gc_duration_seconds_sum{foo="bar"} 0.464658525`,
 		`go_gc_duration_seconds_count{foo="bar"} 30719`,
 	}, "\n")
-	tr := transform.NewReader(strings.NewReader(origin), transformer([]string{`foo="bar"`}))
-	b, err := io.ReadAll(tr)
-	if err != nil {
-		t.Fatal(err)
+
+	tests := []struct {
+		name   string
+		origin string
+		want   string
+	}{
+		{name: "exposition", origin: exposition, want: expositionWant},
+		{
+			name:   "line longer than the read buffer",
+			origin: fmt.Sprintf("metric{value=%q} 1\n", longValue),
+			want:   fmt.Sprintf("metric{value=%q,foo=\"bar\"} 1\n", longValue),
+		},
 	}
-	got := string(b)
-	if !strings.EqualFold(want, got) {
-		t.Error("unexpected result \n" + got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := bufio.NewWriter(&buf)
+			if err := copyBody(w, io.NopCloser(strings.NewReader(tt.origin)), []byte(`foo="bar"`)); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if got := buf.String(); got != tt.want {
+				t.Errorf("want %q, got %q", tt.want, got)
+			}
+		})
 	}
+}
+
+var writeLineTests = []struct {
+	name string
+	line string
+	want string
+}{
+	{name: "without labels", line: "metric 1\n", want: `metric{foo="bar"} 1` + "\n"},
+	{name: "with labels", line: `metric{existing="value"} NaN` + "\n", want: `metric{existing="value",foo="bar"} NaN` + "\n"},
+	{name: "empty labels", line: "metric{} +Inf 123\n", want: `metric{foo="bar"} +Inf 123` + "\n"},
+	{name: "closing brace in value", line: `metric{existing="}"} -Inf` + "\n", want: `metric{existing="}",foo="bar"} -Inf` + "\n"},
+	{name: "help", line: "# HELP metric documentation\n", want: "# HELP metric documentation\n"},
+	{name: "blank", line: "\n", want: "\n"},
+	{name: "invalid", line: "not a sample\n", want: "not a sample\n"},
+	{name: "unterminated label set", line: "metric{unterminated=\"value} 1\n", want: "metric{unterminated=\"value} 1\n"},
+}
+
+// writeLineOutput collects what writeLine emits for line into a single slice, so
+// tests can compare it as a value. bytes.Buffer never fails, so neither can the
+// writes.
+func writeLineOutput(line, extraLabels []byte) []byte {
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	_ = writeLine(w, line, extraLabels)
+	_ = w.Flush()
+	return buf.Bytes()
+}
+
+func Test_writeLine(t *testing.T) {
+	for _, tt := range writeLineTests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := string(writeLineOutput([]byte(tt.line), []byte(`foo="bar"`)))
+			if got != tt.want {
+				t.Errorf("want %q, got %q", tt.want, got)
+			}
+		})
+	}
+
+	t.Run("no extra labels", func(t *testing.T) {
+		const line = "metric 1\n"
+		if got := string(writeLineOutput([]byte(line), nil)); got != line {
+			t.Errorf("want %q, got %q", line, got)
+		}
+	})
+}
+
+func Fuzz_writeLine(f *testing.F) {
+	for _, tt := range writeLineTests {
+		f.Add(tt.line)
+	}
+	f.Add("\x00\xff\n")
+	f.Add(strings.Repeat("x", 4*1024))
+
+	extraLabels := []byte(`fuzz_label="value"`)
+	f.Fuzz(func(t *testing.T, line string) {
+		input := []byte(line)
+		original := bytes.Clone(input)
+		got := writeLineOutput(input, extraLabels)
+
+		if !bytes.Equal(input, original) {
+			t.Fatal("writeLine modified its input")
+		}
+		if !isSubsequence(original, got) {
+			t.Fatalf("output contains changes other than insertion: input=%q output=%q", original, got)
+		}
+		// At most the labels themselves plus the "{}" or "," around them.
+		if delta := len(got) - len(original); delta < 0 || delta > len(extraLabels)+2 {
+			t.Fatalf("unexpected output length change: input=%q output=%q", original, got)
+		}
+	})
+}
+
+func isSubsequence(want, got []byte) bool {
+	for _, b := range got {
+		if len(want) > 0 && b == want[0] {
+			want = want[1:]
+		}
+	}
+	return len(want) == 0
 }

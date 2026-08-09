@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,14 +11,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goccy/go-yaml"
-	"github.com/icholy/replace"
-	"golang.org/x/text/transform"
 )
 
 var (
@@ -146,24 +147,24 @@ func serve(cfg ListenerConfig) error {
 }
 
 func handler(cfg ListenerConfig) http.HandlerFunc {
-	transformers := make(map[string]transform.Transformer)
+	extraLabels := make(map[string][]byte, len(cfg.Exporters))
 	for name, e := range cfg.Exporters {
-		transformers[name] = transformer(append(
+		extraLabels[name] = []byte(strings.Join(append(
 			mapToSliceLabels(e.Labels),
 			mapToSliceLabels(cfg.CommonLabels)...,
-		))
+		), ","))
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		type Payload struct {
-			Name string
-			Body io.ReadCloser
+		type payload struct {
+			extra []byte
+			body  io.ReadCloser
 		}
-		payload := make(chan *Payload, len(cfg.Exporters))
+		payloads := make(chan *payload, len(cfg.Exporters))
 
 		go func() {
-			defer close(payload)
+			defer close(payloads)
 			var wg sync.WaitGroup
 			wg.Add(len(cfg.Exporters))
 			for name, e := range cfg.Exporters {
@@ -181,19 +182,23 @@ func handler(cfg ListenerConfig) http.HandlerFunc {
 						return
 					}
 					slog.Debug("finish fetching", "name", name)
-					payload <- &Payload{Name: name, Body: resp.Body}
+					payloads <- &payload{extra: extraLabels[name], body: resp.Body}
 				}()
 			}
 			wg.Wait()
 		}()
 
-		for p := range payload {
+		bw := bufio.NewWriter(w)
+		for p := range payloads {
 			slog.Debug("start copying body with merging labels")
-			if err := copyBody(w, p.Body, transformers[p.Name]); err != nil {
+			if err := copyBody(bw, p.body, p.extra); err != nil {
 				slog.Error(err.Error())
 				return
 			}
 			slog.Debug("finish copying body")
+		}
+		if err := bw.Flush(); err != nil {
+			slog.Error(err.Error())
 		}
 	}
 }
@@ -203,37 +208,122 @@ func mapToSliceLabels(m map[string]string) []string {
 	for k, v := range m {
 		s = append(s, fmt.Sprintf(`%s="%s"`, k, v))
 	}
+	slices.Sort(s) // map iteration order would make the output unstable
 	return s
 }
 
-var (
-	metricRegex = regexp.MustCompile(`\n(?<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?<labels>\{[^\}].*\})?\s(?<sample>[0-9eE\.\+\-]+)`)
-)
+func copyBody(w *bufio.Writer, body io.ReadCloser, extraLabels []byte) error {
+	defer body.Close()
 
-func transformer(labels []string) transform.Transformer {
-	return replace.RegexpStringSubmatchFunc(metricRegex, mergeLabels(labels))
-}
-
-func mergeLabels(kv []string) func(s []string) string {
-	kvs := strings.Join(kv, ",")
-	return func(s []string) string {
-		name := s[1]
-		labels := s[2]
-		sample := s[3]
-		if labels == "" && kvs == "" {
-			return "\n" + name + " " + sample
+	r := bufio.NewReader(body)
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(line) > 0 {
+			if writeErr := writeLine(w, line, extraLabels); writeErr != nil {
+				return writeErr
+			}
 		}
-		if labels == "" {
-			labels = "{" + kvs + "}"
-		} else {
-			labels = strings.TrimSuffix(labels, "}") + "," + kvs + "}"
+		if err == io.EOF {
+			return nil
 		}
-		return "\n" + name + labels + " " + sample
+		if err != nil {
+			return err
+		}
 	}
 }
 
-func copyBody(w io.Writer, body io.ReadCloser, transformer transform.Transformer) error {
-	defer body.Close()
-	_, err := io.Copy(w, transform.NewReader(body, transformer))
+// writeLine copies line to w, splicing extraLabels into its label set when the
+// line is a sample. Everything else - comments, blank lines, anything that does
+// not parse - is passed through untouched.
+func writeLine(w *bufio.Writer, line, extraLabels []byte) error {
+	at, prefix, suffix, ok := labelInsertPoint(line)
+	if len(extraLabels) == 0 || !ok {
+		_, err := w.Write(line)
+		return err
+	}
+	// bufio.Writer records the first error and fails every later write, so only
+	// the final one needs checking.
+	w.Write(line[:at])
+	w.WriteString(prefix)
+	w.Write(extraLabels)
+	w.WriteString(suffix)
+	_, err := w.Write(line[at:])
 	return err
+}
+
+// labelInsertPoint locates where extra labels belong in a sample line: at is the
+// offset to splice at, and prefix/suffix are the delimiters to write around them
+// ("{" and "}" for a sample with no label set, "," and "" when merging into an
+// existing one). ok is false when line is not a sample.
+func labelInsertPoint(line []byte) (at int, prefix, suffix string, ok bool) {
+	nameEnd := metricNameEnd(line)
+	if nameEnd == 0 || nameEnd == len(line) {
+		return
+	}
+
+	switch line[nameEnd] {
+	case ' ', '\t':
+		if !hasSampleValue(line, nameEnd) {
+			return
+		}
+		return nameEnd, "{", "}", true
+	case '{':
+		labelsEnd := labelSetEnd(line, nameEnd)
+		if labelsEnd < 0 || labelsEnd+1 >= len(line) || (line[labelsEnd+1] != ' ' && line[labelsEnd+1] != '\t') {
+			return
+		}
+		if !hasSampleValue(line, labelsEnd+1) {
+			return
+		}
+		if len(bytes.TrimSpace(line[nameEnd+1:labelsEnd])) > 0 {
+			prefix = ","
+		}
+		return labelsEnd, prefix, "", true
+	default:
+		return
+	}
+}
+
+func hasSampleValue(line []byte, valueStart int) bool {
+	value := bytes.TrimLeft(line[valueStart:], " \t")
+	if i := bytes.IndexAny(value, " \t\r\n"); i >= 0 {
+		value = value[:i]
+	}
+	if len(value) == 0 {
+		return false
+	}
+	_, err := strconv.ParseFloat(string(value), 64)
+	return err == nil
+}
+
+func metricNameEnd(line []byte) int {
+	if len(line) == 0 || !isMetricNameStart(line[0]) {
+		return 0
+	}
+	for i := 1; i < len(line); i++ {
+		c := line[i]
+		if !(isMetricNameStart(c) || c >= '0' && c <= '9') {
+			return i
+		}
+	}
+	return len(line)
+}
+
+func isMetricNameStart(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c == ':'
+}
+
+func labelSetEnd(line []byte, labelsStart int) int {
+	inQuotes := false
+	for i := labelsStart + 1; i < len(line); i++ {
+		switch {
+		case inQuotes && line[i] == '\\':
+			i++ // skip the escaped byte
+		case line[i] == '"':
+			inQuotes = !inQuotes
+		case !inQuotes && line[i] == '}':
+			return i
+		}
+	}
+	return -1
 }
