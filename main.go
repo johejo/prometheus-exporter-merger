@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goccy/go-yaml"
@@ -48,6 +49,7 @@ func main() {
 	for name, lc := range *cfg {
 		go func() {
 			defer wg.Done()
+			lc.name = name
 			slog.Info("start", "name", name, "address", lc.Address)
 			if err := serve(lc); err != nil {
 				slog.Error(err.Error())
@@ -60,7 +62,7 @@ func main() {
 		mux := http.NewServeMux()
 		metrics.ExposeMetadata(*selfMetricsExposeMetdata)
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-			metrics.WriteProcessMetrics(w)
+			metrics.WritePrometheus(w, true)
 		})
 		if err := http.ListenAndServe(*selfMetricsAddress, mux); err != nil {
 			slog.Error(err.Error())
@@ -76,11 +78,13 @@ type ListenerConfig struct {
 	Path         string              `json:"path" yaml:"path"`
 	Exporters    map[string]Exporter `json:"exporters" yaml:"exporters"`
 	CommonLabels map[string]string   `json:"commonLabels" yaml:"commonLabels"`
+	name         string
 }
 
 type Exporter struct {
-	URI    string            `json:"uri" yaml:"uri"`
-	Labels map[string]string `json:"labels" yaml:"labels"`
+	URI     string            `json:"uri" yaml:"uri"`
+	Timeout time.Duration     `json:"timeout" yaml:"timeout"`
+	Labels  map[string]string `json:"labels" yaml:"labels"`
 }
 
 func initLogger(loglevel string) {
@@ -121,17 +125,7 @@ func loadConfig(config string, expandEnv bool) (*Config, error) {
 	}
 
 	var cfg Config
-	var unmarshal func(b []byte, dst any) error
-	switch filepath.Ext(config) {
-	case ".json":
-		unmarshal = json.Unmarshal
-	case ".yaml", ".yml":
-		unmarshal = yaml.Unmarshal
-	default:
-		return nil, fmt.Errorf("unsupported file %s", config)
-	}
-
-	if err := unmarshal(b, &cfg); err != nil {
+	if err := yaml.Unmarshal(b, &cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
@@ -143,81 +137,105 @@ func serve(cfg ListenerConfig) error {
 	return http.ListenAndServe(cfg.Address, mux)
 }
 
-// target is an exporter resolved against its listener's configuration, with the
-// labels to splice into its samples precomputed once at handler construction.
 type target struct {
-	name  string
-	uri   string
-	extra []byte
+	name     string
+	uri      string
+	timeout  time.Duration
+	extra    []byte
+	requests *metrics.Counter
+	failures *metrics.Counter
+	duration *metrics.PrometheusHistogram
 }
 
-// payload is a fetched exporter response on its way to the merged output. The
-// receiver owns body and is responsible for closing it.
-type payload struct {
-	extra []byte
-	body  io.ReadCloser
+type fetchResult struct {
+	target  target
+	body    io.ReadCloser
+	cancel  context.CancelFunc
+	started time.Time
+	err     error
 }
 
 func handler(cfg ListenerConfig) http.HandlerFunc {
 	targets := make([]target, 0, len(cfg.Exporters))
 	for name, e := range cfg.Exporters {
+		metricLabels := fmt.Sprintf(
+			`listener="%s",upstream="%s"`,
+			labelValueEscaper.Replace(cfg.name),
+			labelValueEscaper.Replace(name),
+		)
 		targets = append(targets, target{
-			name: name,
-			uri:  e.URI,
+			name:    name,
+			uri:     e.URI,
+			timeout: e.Timeout,
 			extra: []byte(strings.Join(append(
 				mapToSliceLabels(e.Labels),
 				mapToSliceLabels(cfg.CommonLabels)...,
 			), ",")),
+			requests: metrics.GetOrCreateCounter(
+				"exporter_merger_upstream_requests_total{" + metricLabels + "}",
+			),
+			failures: metrics.GetOrCreateCounter(
+				"exporter_merger_upstream_request_failures_total{" + metricLabels + "}",
+			),
+			duration: metrics.GetOrCreatePrometheusHistogram(
+				"exporter_merger_upstream_request_duration_seconds{" + metricLabels + "}",
+			),
 		})
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
-		payloads := make(chan payload, len(targets))
+		results := make(chan fetchResult, len(targets))
+		for _, t := range targets {
+			go fetch(ctx, t, results)
+		}
 
-		go func() {
-			defer close(payloads)
-			var wg sync.WaitGroup
-			wg.Add(len(targets))
-			for _, t := range targets {
-				go func() {
-					defer wg.Done()
-					slog.Debug("start fetching", "name", t.name, "uri", t.uri)
-					req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.uri, nil)
-					if err != nil {
-						slog.Error(err.Error())
-						return
-					}
-					resp, err := httpClient().Do(req)
-					if err != nil {
-						slog.Error(err.Error())
-						return
-					}
-					slog.Debug("finish fetching", "name", t.name)
-					select {
-					case payloads <- payload{extra: t.extra, body: resp.Body}:
-					case <-ctx.Done():
-						resp.Body.Close() // the hand-off failed, so ownership never transferred
-					}
-				}()
-			}
-			wg.Wait()
-		}()
-
-		bw := bufio.NewWriter(w)
-		var copyErr error
-		for p := range payloads {
-			if copyErr == nil {
-				slog.Debug("start copying body with merging labels")
-				if copyErr = copyBody(bw, p.body, p.extra); copyErr != nil {
-					slog.Error(copyErr.Error())
-					cancel() // stop in-flight fetches; whatever is already on its way is drained here
-				} else {
-					slog.Debug("finish copying body")
+		// Do not copy any body until every upstream has returned its headers. This
+		// lets us return an error instead of a partial successful exposition.
+		fetched := make([]fetchResult, 0, len(targets))
+		failed := false
+		for range targets {
+			result := <-results
+			if result.err != nil {
+				// The first failure makes the merged response impossible. Cancel
+				// outstanding requests immediately, but don't blame upstreams which
+				// merely observed that cancellation.
+				if !failed || !errors.Is(result.err, context.Canceled) {
+					result.target.failures.Inc()
+				}
+				slog.Error("failed fetching upstream", "name", result.target.name, "uri", result.target.uri, "error", result.err)
+				if !failed {
+					failed = true
+					cancel()
 				}
 			}
-			p.body.Close()
+			fetched = append(fetched, result)
+		}
+		if failed {
+			for i := range fetched {
+				fetched[i].close()
+			}
+			http.Error(w, "failed to fetch upstream exporters", http.StatusBadGateway)
+			return
+		}
+
+		bw := bufio.NewWriter(w)
+		seenMetadata := make(map[string]struct{})
+		var copyErr error
+		for i := range fetched {
+			result := &fetched[i]
+			if copyErr == nil {
+				slog.Debug("start copying body with merging labels", "name", result.target.name)
+				if copyErr = copyBody(bw, result.body, result.target.extra, seenMetadata); copyErr != nil {
+					result.target.failures.Inc()
+					slog.Error("failed reading upstream response", "name", result.target.name, "uri", result.target.uri, "error", copyErr)
+					cancel()
+				} else {
+					slog.Debug("finish copying body", "name", result.target.name)
+				}
+			}
+			result.close()
 		}
 		if copyErr != nil {
 			return
@@ -226,6 +244,47 @@ func handler(cfg ListenerConfig) http.HandlerFunc {
 			slog.Error(err.Error())
 		}
 	}
+}
+
+func fetch(ctx context.Context, t target, results chan<- fetchResult) {
+	result := fetchResult{target: t, started: time.Now()}
+	requestCtx := ctx
+	result.cancel = func() {}
+	if t.timeout > 0 {
+		requestCtx, result.cancel = context.WithTimeout(ctx, t.timeout)
+	}
+
+	slog.Debug("start fetching", "name", t.name, "uri", t.uri, "timeout", t.timeout)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, t.uri, nil)
+	if err != nil {
+		result.err = err
+		results <- result
+		return
+	}
+	resp, err := httpClient().Do(req)
+	if err != nil {
+		result.err = err
+		results <- result
+		return
+	}
+	result.body = resp.Body
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		result.err = fmt.Errorf("unexpected HTTP status %s", resp.Status)
+	} else {
+		slog.Debug("received upstream headers", "name", t.name, "status", resp.Status)
+	}
+	results <- result
+}
+
+func (r *fetchResult) close() {
+	if r.body != nil {
+		if err := r.body.Close(); err != nil {
+			slog.Debug("failed closing upstream response", "name", r.target.name, "error", err)
+		}
+	}
+	r.cancel()
+	r.target.requests.Inc()
+	r.target.duration.UpdateDuration(r.started)
 }
 
 var labelValueEscaper = strings.NewReplacer(
@@ -247,14 +306,8 @@ func mapToSliceLabels(m map[string]string) []string {
 // fits, which keeps copyBody on its zero-copy path.
 const readBufferSize = 64 << 10
 
-// copyBody streams body to w, splicing extraLabels into every sample line. It
-// does not close body; the caller owns it.
-func copyBody(w *bufio.Writer, body io.Reader, extraLabels []byte) error {
-	if len(extraLabels) == 0 {
-		_, err := io.Copy(w, body)
-		return err
-	}
-
+// seenMetadata is shared across bodies so the first HELP and TYPE definitions win.
+func copyBody(w *bufio.Writer, body io.Reader, extraLabels []byte, seenMetadata map[string]struct{}) error {
 	r := bufio.NewReaderSize(body, readBufferSize)
 	// ReadSlice returns a view into r's buffer, so no per-line allocation. Only a
 	// line too long to fit gets assembled into joined, which is reused after that.
@@ -269,7 +322,7 @@ func copyBody(w *bufio.Writer, body io.Reader, extraLabels []byte) error {
 			}
 			line = joined
 		}
-		if len(line) > 0 {
+		if len(line) > 0 && !duplicateMetadata(seenMetadata, line) {
 			if err := writeLine(w, line, extraLabels); err != nil {
 				return err
 			}
@@ -283,10 +336,41 @@ func copyBody(w *bufio.Writer, body io.Reader, extraLabels []byte) error {
 	}
 }
 
-// writeLine copies line to w, splicing the non-empty extraLabels into its label
-// set when the line is a sample. Everything else - comments, blank lines,
-// anything that does not parse - is passed through untouched.
+func duplicateMetadata(seen map[string]struct{}, line []byte) bool {
+	key, ok := parseMetadataKey(line)
+	if !ok {
+		return false
+	}
+	// Looking up a []byte in a map[string]T does not copy the key, so only a
+	// first sighting allocates.
+	if _, duplicate := seen[string(key)]; duplicate {
+		return true
+	}
+	seen[string(key)] = struct{}{}
+	return false
+}
+
+func parseMetadataKey(line []byte) ([]byte, bool) {
+	rest, ok := bytes.CutPrefix(line, []byte("# "))
+	if !ok {
+		return nil, false
+	}
+	directive, metric, ok := bytes.Cut(rest, []byte(" "))
+	if !ok || string(directive) != "HELP" && string(directive) != "TYPE" {
+		return nil, false
+	}
+	metricEnd := bytes.IndexAny(metric, " \t\r\n")
+	if metricEnd <= 0 {
+		return nil, false
+	}
+	return rest[:len(directive)+1+metricEnd], true
+}
+
 func writeLine(w *bufio.Writer, line, extraLabels []byte) error {
+	if len(extraLabels) == 0 {
+		_, err := w.Write(line)
+		return err
+	}
 	at, prefix, suffix, ok := labelInsertPoint(line)
 	if !ok {
 		_, err := w.Write(line)
@@ -302,10 +386,6 @@ func writeLine(w *bufio.Writer, line, extraLabels []byte) error {
 	return err
 }
 
-// labelInsertPoint locates where extra labels belong in a sample line: at is the
-// offset to splice at, and prefix/suffix are the delimiters to write around them
-// ("{" and "}" for a sample with no label set, "," and "" when merging into an
-// existing one). ok is false when line is not a sample.
 func labelInsertPoint(line []byte) (at int, prefix, suffix string, ok bool) {
 	nameEnd := metricNameEnd(line)
 	if nameEnd == 0 || nameEnd == len(line) {
@@ -332,9 +412,6 @@ func labelInsertPoint(line []byte) (at int, prefix, suffix string, ok bool) {
 	}
 }
 
-// hasSampleValue reports whether a numeric sample value follows valueStart,
-// which must be the offset of the whitespace separating the value from the
-// metric name or label set.
 func hasSampleValue(line []byte, valueStart int) bool {
 	rest := line[valueStart:]
 	if len(rest) == 0 || (rest[0] != ' ' && rest[0] != '\t') {

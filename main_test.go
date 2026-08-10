@@ -8,16 +8,21 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
+	"time"
+
+	"github.com/VictoriaMetrics/metrics"
 )
 
 func TestHandler(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "# HELP metric documentation\nmetric 1\n")
+		_, _ = io.WriteString(w, "# HELP metric documentation\n# TYPE metric gauge\nmetric 1\n")
 	}))
 	defer upstream.Close()
 
@@ -34,7 +39,13 @@ func TestHandler(t *testing.T) {
 	body := rec.Body.String()
 
 	if want, got := 4, countLines(body); want != got {
-		t.Errorf("line count should be same as upstream exporters: want=%d, got=%d", want, got)
+		t.Errorf("duplicate metadata should be omitted: want=%d, got=%d", want, got)
+	}
+	if want, got := 1, strings.Count(body, "# HELP metric documentation"); want != got {
+		t.Errorf("HELP should occur once: want=%d, got=%d", want, got)
+	}
+	if want, got := 1, strings.Count(body, "# TYPE metric gauge"); want != got {
+		t.Errorf("TYPE should occur once: want=%d, got=%d", want, got)
 	}
 	if want, got := 2, strings.Count(body, `metric{foo="bar"} 1`); want != got {
 		t.Errorf("all samples should contain common labels: want=%d, got=%d", want, got)
@@ -83,6 +94,178 @@ func TestHandlerClosesAllResponseBodiesAfterCopyError(t *testing.T) {
 	}
 }
 
+func TestHandlerChecksAllHeadersBeforeWritingBodies(t *testing.T) {
+	successBody := &trackingBody{Reader: strings.NewReader("must_not_be_merged 1\n")}
+	failureBody := &trackingBody{Reader: strings.NewReader("upstream_error 1\n")}
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		body := successBody
+		if req.URL.Host == "failure" {
+			status = http.StatusServiceUnavailable
+			body = failureBody
+		}
+		return &http.Response{
+			StatusCode: status,
+			Status:     http.StatusText(status),
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    req,
+		}, nil
+	})
+
+	originalHTTPClient := httpClient
+	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
+	t.Cleanup(func() { httpClient = originalHTTPClient })
+
+	cfg := ListenerConfig{
+		Path: "/metrics",
+		name: "header-check-test",
+		Exporters: map[string]Exporter{
+			"success": {URI: "http://success"},
+			"failure": {URI: "http://failure"},
+		},
+	}
+	failures := metrics.GetOrCreateCounter(
+		`exporter_merger_upstream_request_failures_total{listener="header-check-test",upstream="failure"}`,
+	)
+	before := failures.Get()
+	rec := httptest.NewRecorder()
+	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if got, want := rec.Code, http.StatusBadGateway; got != want {
+		t.Errorf("status: got %d, want %d", got, want)
+	}
+	if successBody.reads.Load() != 0 || failureBody.reads.Load() != 0 {
+		t.Errorf("response body was read before all headers passed validation")
+	}
+	if !successBody.closed.Load() || !failureBody.closed.Load() {
+		t.Errorf("all response bodies must be closed after header validation fails")
+	}
+	if got := failures.Get() - before; got != 1 {
+		t.Errorf("failure counter increased by %d, want 1", got)
+	}
+}
+
+func TestHandlerAppliesUpstreamTimeout(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	originalHTTPClient := httpClient
+	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
+	t.Cleanup(func() { httpClient = originalHTTPClient })
+
+	cfg := ListenerConfig{
+		Path: "/metrics",
+		name: "timeout-test",
+		Exporters: map[string]Exporter{
+			"slow": {URI: "http://slow", Timeout: 10 * time.Millisecond},
+		},
+	}
+	started := time.Now()
+	rec := httptest.NewRecorder()
+	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if got, want := rec.Code, http.StatusBadGateway; got != want {
+		t.Errorf("status: got %d, want %d", got, want)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Errorf("upstream timeout took too long: %s", elapsed)
+	}
+}
+
+func TestHandlerCancelsOtherUpstreamsAfterFailure(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "failure" {
+			return nil, errors.New("connection failed")
+		}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	originalHTTPClient := httpClient
+	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
+	t.Cleanup(func() { httpClient = originalHTTPClient })
+
+	cfg := ListenerConfig{
+		Path: "/metrics",
+		name: "cancel-test",
+		Exporters: map[string]Exporter{
+			"failure": {URI: "http://failure"},
+			"waiting": {URI: "http://waiting"},
+		},
+	}
+	waitingFailures := metrics.GetOrCreateCounter(
+		`exporter_merger_upstream_request_failures_total{listener="cancel-test",upstream="waiting"}`,
+	)
+	before := waitingFailures.Get()
+	rec := httptest.NewRecorder()
+	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if got, want := rec.Code, http.StatusBadGateway; got != want {
+		t.Errorf("status: got %d, want %d", got, want)
+	}
+	if got := waitingFailures.Get() - before; got != 0 {
+		t.Errorf("canceled sibling failure counter increased by %d, want 0", got)
+	}
+}
+
+func TestLoadConfigParsesExporterTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`default:
+  address: ":8080"
+  path: /metrics
+  exporters:
+    node:
+      uri: http://node/metrics
+      timeout: 2.5s
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := (*cfg)["default"].Exporters["node"].Timeout, 2500*time.Millisecond; got != want {
+		t.Errorf("timeout: got %s, want %s", got, want)
+	}
+}
+
+func TestHandlerRecordsUpstreamDuration(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("metric 1\n")),
+			Request:    req,
+		}, nil
+	})
+	originalHTTPClient := httpClient
+	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
+	t.Cleanup(func() { httpClient = originalHTTPClient })
+
+	cfg := ListenerConfig{
+		Path: "/metrics",
+		name: "duration-test",
+		Exporters: map[string]Exporter{
+			"success": {URI: "http://success"},
+		},
+	}
+	handler(cfg).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	var output bytes.Buffer
+	metrics.WritePrometheus(&output, false)
+	for _, want := range []string{
+		`exporter_merger_upstream_requests_total{listener="duration-test",upstream="success"} 1`,
+		`exporter_merger_upstream_request_duration_seconds_count{listener="duration-test",upstream="success"} 1`,
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("self metrics do not contain %q", want)
+		}
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -92,6 +275,22 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 type trackingReadCloser struct {
 	io.Reader
 	closed atomic.Bool
+}
+
+type trackingBody struct {
+	io.Reader
+	reads  atomic.Int64
+	closed atomic.Bool
+}
+
+func (r *trackingBody) Read(p []byte) (int, error) {
+	r.reads.Add(1)
+	return r.Reader.Read(p)
+}
+
+func (r *trackingBody) Close() error {
+	r.closed.Store(true)
+	return nil
 }
 
 func (r *trackingReadCloser) Close() error {
@@ -127,7 +326,7 @@ func Test_mapToSliceLabelsEscapesValues(t *testing.T) {
 }
 
 func Test_copyBody(t *testing.T) {
-	longValue := strings.Repeat("x", 2*readBufferSize) // forces the read buffer to overflow
+	longValue := strings.Repeat("x", 2*readBufferSize)
 	exposition := strings.Join([]string{
 		`# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.`,
 		`# TYPE go_gc_duration_seconds summary`,
@@ -155,26 +354,38 @@ func Test_copyBody(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		origin      string
+		origins     []string
 		extraLabels string
 		want        string
 	}{
-		{name: "exposition", origin: exposition, extraLabels: `foo="bar"`, want: expositionWant},
+		{name: "exposition", origins: []string{exposition}, extraLabels: `foo="bar"`, want: expositionWant},
 		{
 			name:        "line longer than the read buffer",
-			origin:      fmt.Sprintf("metric{value=%q} 1\n", longValue),
+			origins:     []string{fmt.Sprintf("metric{value=%q} 1\n", longValue)},
 			extraLabels: `foo="bar"`,
 			want:        fmt.Sprintf("metric{value=%q,foo=\"bar\"} 1\n", longValue),
 		},
-		{name: "no extra labels", origin: exposition, want: exposition},
+		{name: "no extra labels", origins: []string{exposition}, want: exposition},
+		{
+			name: "duplicate metadata across bodies",
+			origins: []string{
+				"# HELP shared first documentation\n# TYPE shared gauge\n# HELP first_only documentation\nfirst_only 1\nshared 1\n",
+				"# HELP shared conflicting documentation\n# TYPE shared counter\n# HELP second_only documentation\nsecond_only 2\nshared 2\n",
+			},
+			want: "# HELP shared first documentation\n# TYPE shared gauge\n# HELP first_only documentation\nfirst_only 1\nshared 1\n" +
+				"# HELP second_only documentation\nsecond_only 2\nshared 2\n",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			w := bufio.NewWriter(&buf)
-			if err := copyBody(w, strings.NewReader(tt.origin), []byte(tt.extraLabels)); err != nil {
-				t.Fatal(err)
+			seen := make(map[string]struct{})
+			for _, origin := range tt.origins {
+				if err := copyBody(w, strings.NewReader(origin), []byte(tt.extraLabels), seen); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := w.Flush(); err != nil {
 				t.Fatal(err)
@@ -201,9 +412,6 @@ var writeLineTests = []struct {
 	{name: "unterminated label set", line: "metric{unterminated=\"value} 1\n", want: "metric{unterminated=\"value} 1\n"},
 }
 
-// writeLineOutput collects what writeLine emits for line into a single slice, so
-// tests can compare it as a value. bytes.Buffer never fails, so neither can the
-// writes.
 func writeLineOutput(line, extraLabels []byte) []byte {
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
@@ -242,7 +450,6 @@ func Fuzz_writeLine(f *testing.F) {
 		if !isSubsequence(original, got) {
 			t.Fatalf("output contains changes other than insertion: input=%q output=%q", original, got)
 		}
-		// At most the labels themselves plus the "{}" or "," around them.
 		if delta := len(got) - len(original); delta < 0 || delta > len(extraLabels)+2 {
 			t.Fatalf("unexpected output length change: input=%q output=%q", original, got)
 		}
