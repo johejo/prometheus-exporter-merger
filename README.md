@@ -50,3 +50,5 @@ Usage of prometheus-exporter-merger:
 See ./testdata/config.yaml
 
 An optional duration string such as `timeout: 5s` sets the timeout independently for each upstream. A missing or zero timeout means no per-upstream timeout.
+
+Configuration is validated before listeners start; unknown fields, invalid listener or exporter settings, and conflicting labels are rejected.

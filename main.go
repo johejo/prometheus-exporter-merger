@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -38,6 +40,10 @@ func main() {
 
 	cfg, err := loadConfig(*config, *expandEnv)
 	if err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
+	if err := validateConfig(*cfg, *selfMetricsAddress); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
@@ -125,10 +131,108 @@ func loadConfig(config string, expandEnv bool) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(b, &cfg); err != nil {
+	if err := yaml.UnmarshalWithOptions(b, &cfg, yaml.DisallowUnknownField()); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func validateConfig(cfg Config, selfMetricsAddress string) error {
+	var errs []error
+	if len(cfg) == 0 {
+		errs = append(errs, errors.New("at least one listener is required"))
+	}
+	if selfMetricsAddress == "" {
+		errs = append(errs, errors.New("self metrics address must not be empty"))
+	}
+
+	addresses := make(map[string]string, len(cfg))
+	if selfMetricsAddress != "" {
+		addresses[selfMetricsAddress] = "self metrics"
+	}
+	for _, name := range slices.Sorted(maps.Keys(cfg)) {
+		listener := cfg[name]
+		location := fmt.Sprintf("listener %q", name)
+		if name == "" {
+			errs = append(errs, errors.New("listener name must not be empty"))
+		}
+		if listener.Address == "" {
+			errs = append(errs, fmt.Errorf("%s: address must not be empty", location))
+		} else if previous, ok := addresses[listener.Address]; ok {
+			errs = append(errs, fmt.Errorf("%s: address %q is also used by %s", location, listener.Address, previous))
+		} else {
+			addresses[listener.Address] = location
+		}
+		if err := validateListenerPath(listener.Path); err != nil {
+			errs = append(errs, fmt.Errorf("%s: path: %w", location, err))
+		}
+		if len(listener.Exporters) == 0 {
+			errs = append(errs, fmt.Errorf("%s: at least one exporter is required", location))
+		}
+		for _, label := range slices.Sorted(maps.Keys(listener.CommonLabels)) {
+			if !validLabelName(label) {
+				errs = append(errs, fmt.Errorf("%s: commonLabels: invalid label name %q", location, label))
+			}
+		}
+
+		for _, exporterName := range slices.Sorted(maps.Keys(listener.Exporters)) {
+			exporter := listener.Exporters[exporterName]
+			exporterLocation := fmt.Sprintf("%s: exporter %q", location, exporterName)
+			if exporterName == "" {
+				errs = append(errs, fmt.Errorf("%s: exporter name must not be empty", location))
+			}
+			if err := validateExporterURI(exporter.URI); err != nil {
+				errs = append(errs, fmt.Errorf("%s: uri: %w", exporterLocation, err))
+			}
+			if exporter.Timeout < 0 {
+				errs = append(errs, fmt.Errorf("%s: timeout must not be negative", exporterLocation))
+			}
+			for _, label := range slices.Sorted(maps.Keys(exporter.Labels)) {
+				if !validLabelName(label) {
+					errs = append(errs, fmt.Errorf("%s: labels: invalid label name %q", exporterLocation, label))
+				}
+				if _, duplicate := listener.CommonLabels[label]; duplicate {
+					errs = append(errs, fmt.Errorf("%s: label %q is also defined in commonLabels", exporterLocation, label))
+				}
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("invalid config: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
+func validateExporterURI(raw string) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URI: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return errors.New("scheme must be http or https")
+	}
+	if u.Host == "" {
+		return errors.New("host must not be empty")
+	}
+	return nil
+}
+
+func validateListenerPath(path string) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("invalid HTTP pattern: %v", recovered)
+		}
+	}()
+	if !strings.HasPrefix(path, "/") {
+		return errors.New("must start with /")
+	}
+	http.NewServeMux().Handle(path, http.NotFoundHandler()) // panics on malformed patterns
+	return nil
+}
+
+func validLabelName(name string) bool {
+	return name != "" && metricNameEnd([]byte(name)) == len(name) && !strings.Contains(name, ":")
 }
 
 func serve(cfg ListenerConfig) error {

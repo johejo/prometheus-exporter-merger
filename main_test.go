@@ -231,6 +231,83 @@ func TestLoadConfigParsesExporterTimeout(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsUnknownField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`default:
+  address: ":8080"
+  path: /metrics
+  unexpected: value
+  exporters:
+    node:
+      uri: http://node/metrics
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := loadConfig(path, false); err == nil {
+		t.Fatal("unknown field should be rejected")
+	}
+}
+
+func TestValidateConfig(t *testing.T) {
+	valid := Config{
+		"default": {
+			Address:      ":8080",
+			Path:         "/metrics",
+			CommonLabels: map[string]string{"machine": "foo"},
+			Exporters: map[string]Exporter{
+				"node": {
+					URI:     "http://node:9100/metrics",
+					Timeout: 5 * time.Second,
+					Labels:  map[string]string{"job": "node"},
+				},
+			},
+		},
+	}
+	if err := validateConfig(valid, ":9716"); err != nil {
+		t.Fatalf("valid config was rejected: %v", err)
+	}
+
+	invalid := Config{
+		"broken": {
+			Address:      ":9716",
+			Path:         "metrics",
+			CommonLabels: map[string]string{"bad-label": "value", "job": "common"},
+			Exporters: map[string]Exporter{
+				"node": {
+					URI:     "ftp://node/metrics",
+					Timeout: -time.Second,
+					Labels:  map[string]string{"job": "exporter"},
+				},
+			},
+		},
+		"malformed_path": {
+			Address: ":8081",
+			Path:    "/metrics/{",
+			Exporters: map[string]Exporter{
+				"node": {URI: "http://node/metrics"},
+			},
+		},
+	}
+	err := validateConfig(invalid, ":9716")
+	if err == nil {
+		t.Fatal("invalid config was accepted")
+	}
+	for _, want := range []string{
+		`address ":9716" is also used by self metrics`,
+		`path: must start with /`,
+		`invalid HTTP pattern`,
+		`invalid label name "bad-label"`,
+		`scheme must be http or https`,
+		`timeout must not be negative`,
+		`label "job" is also defined in commonLabels`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("validation error %q does not contain %q", err, want)
+		}
+	}
+}
+
 func TestHandlerRecordsUpstreamDuration(t *testing.T) {
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
