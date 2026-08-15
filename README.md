@@ -43,6 +43,8 @@ Usage of prometheus-exporter-merger:
         listen address for self metrics (default ":9716")
   -self-metrics-expose-metadata
         expose self metrics metadata (default true)
+  -version
+        print version and exit
 ```
 
 ## Example

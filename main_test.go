@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,33 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/klauspost/compress/zstd"
 )
+
+func TestCurrentVersion(t *testing.T) {
+	t.Run("ldflags version", func(t *testing.T) {
+		original := version
+		version = "v1.2.3"
+		t.Cleanup(func() { version = original })
+
+		if got, want := currentVersion(), "v1.2.3"; got != want {
+			t.Fatalf("currentVersion() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("build info fallback", func(t *testing.T) {
+		original := version
+		version = ""
+		t.Cleanup(func() { version = original })
+
+		buildInfo, ok := debug.ReadBuildInfo()
+		want := "unknown"
+		if ok && buildInfo.Main.Version != "" {
+			want = buildInfo.Main.Version
+		}
+		if got := currentVersion(); got != want {
+			t.Fatalf("currentVersion() = %q, want %q", got, want)
+		}
+	})
+}
 
 func TestResponseCompression(t *testing.T) {
 	wrapper, err := newCompressionWrapper()

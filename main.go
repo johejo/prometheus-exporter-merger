@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,6 +35,8 @@ const (
 )
 
 var (
+	version                  string
+	showVersion              = flag.Bool("version", false, "print version and exit")
 	httpClient               = http.DefaultClient
 	logLevel                 = flag.String("log-level", "info", "logging level: debug, info, warn, error")
 	config                   = flag.String("config", "config.yaml", "configuration file path")
@@ -44,6 +47,10 @@ var (
 
 func main() {
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(currentVersion())
+		return
+	}
 
 	initLogger(*logLevel)
 	metrics.ExposeMetadata(*selfMetricsExposeMetdata)
@@ -66,6 +73,17 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
+}
+
+func currentVersion() string {
+	if version != "" {
+		return version
+	}
+	buildInfo, ok := debug.ReadBuildInfo()
+	if !ok || buildInfo.Main.Version == "" {
+		return "unknown"
+	}
+	return buildInfo.Main.Version
 }
 
 type Config map[string]ListenerConfig
