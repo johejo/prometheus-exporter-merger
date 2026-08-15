@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -438,13 +439,26 @@ func TestValidateConfig(t *testing.T) {
 	}
 }
 
-func TestHandlerRecordsUpstreamDuration(t *testing.T) {
+func TestHandlerRecordsMetricsAfterConsumingUpstreamBody(t *testing.T) {
+	const metricLabels = `listener="duration-test",upstream="success"`
+	const durationCount = "exporter_merger_upstream_request_duration_seconds_count{" + metricLabels + "}"
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
+
+	body := &blockingBody{
+		trackingBody: trackingBody{Reader: strings.NewReader("metric 1\n")},
+		started:      started,
+		release:      release,
+	}
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Status:     "200 OK",
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("metric 1\n")),
+			Body:       body,
 			Request:    req,
 		}, nil
 	})
@@ -456,18 +470,63 @@ func TestHandlerRecordsUpstreamDuration(t *testing.T) {
 			"success": {URI: "http://success"},
 		},
 	}
-	handler("duration-test", cfg).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	requests := metrics.GetOrCreateCounter("exporter_merger_upstream_requests_total{" + metricLabels + "}")
+	requestsBefore := requests.Get()
+	durationsBefore := metricValue(t, durationCount)
+	assertRecorded := func(when string, want uint64) {
+		t.Helper()
+		if got := requests.Get() - requestsBefore; got != want {
+			t.Errorf("request counter %s increased by %d, want %d", when, got, want)
+		}
+		if got := metricValue(t, durationCount) - durationsBefore; got != want {
+			t.Errorf("request duration count %s increased by %d, want %d", when, got, want)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler("duration-test", cfg).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start consuming the upstream body")
+	}
+	assertRecorded("before consuming body", 0)
+
+	releaseOnce()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not finish after the upstream body was released")
+	}
+	if !body.closed.Load() {
+		t.Error("upstream body was not closed")
+	}
+	assertRecorded("after consuming body", 1)
+}
+
+// metricValue reports the current value of the named self metric, or zero if
+// it has not been registered yet.
+func metricValue(t *testing.T, name string) uint64 {
+	t.Helper()
 
 	var output bytes.Buffer
 	metrics.WritePrometheus(&output, false)
-	for _, want := range []string{
-		`exporter_merger_upstream_requests_total{listener="duration-test",upstream="success"} 1`,
-		`exporter_merger_upstream_request_duration_seconds_count{listener="duration-test",upstream="success"} 1`,
-	} {
-		if !strings.Contains(output.String(), want) {
-			t.Errorf("self metrics do not contain %q", want)
+	for line := range strings.Lines(output.String()) {
+		value, ok := strings.CutPrefix(strings.TrimSuffix(line, "\n"), name+" ")
+		if !ok {
+			continue
 		}
+		n, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			t.Fatalf("parse self metric %q: %v", line, err)
+		}
+		return n
 	}
+	return 0
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -496,6 +555,21 @@ func (r *trackingBody) Read(p []byte) (int, error) {
 func (r *trackingBody) Close() error {
 	r.closed.Store(true)
 	return nil
+}
+
+// blockingBody is a trackingBody that signals on started when the first read
+// begins and blocks there until release is closed.
+type blockingBody struct {
+	trackingBody
+	started chan<- struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingBody) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return r.trackingBody.Read(p)
 }
 
 func countLines(s string) int {
