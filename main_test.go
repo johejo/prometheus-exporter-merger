@@ -823,6 +823,11 @@ func Fuzz_writeLine(f *testing.F) {
 	f.Add(strings.Repeat("x", 4*1024))
 
 	extraLabels := []byte(`fuzz_label="value"`)
+	allowedInsertions := [][]byte{
+		extraLabels,
+		append([]byte{','}, extraLabels...),
+		fmt.Appendf(nil, "{%s}", extraLabels),
+	}
 	f.Fuzz(func(t *testing.T, line string) {
 		input := []byte(line)
 		original := bytes.Clone(input)
@@ -831,11 +836,12 @@ func Fuzz_writeLine(f *testing.F) {
 		if !bytes.Equal(input, original) {
 			t.Fatal("writeLine modified its input")
 		}
-		if !isSubsequence(original, got) {
-			t.Fatalf("output contains changes other than insertion: input=%q output=%q", original, got)
+		validOutput := bytes.Equal(got, original)
+		for _, inserted := range allowedInsertions {
+			validOutput = validOutput || isSingleInsertion(original, got, inserted)
 		}
-		if delta := len(got) - len(original); delta < 0 || delta > len(extraLabels)+2 {
-			t.Fatalf("unexpected output length change: input=%q output=%q", original, got)
+		if !validOutput {
+			t.Fatalf("output contains an unexpected change: input=%q output=%q", original, got)
 		}
 	})
 }
@@ -882,11 +888,16 @@ func Fuzz_writeLineValidSamples(f *testing.F) {
 	})
 }
 
-func isSubsequence(want, got []byte) bool {
-	for _, b := range got {
-		if len(want) > 0 && b == want[0] {
-			want = want[1:]
+func isSingleInsertion(original, got, inserted []byte) bool {
+	if len(got) != len(original)+len(inserted) {
+		return false
+	}
+	for at := range len(original) + 1 {
+		if bytes.Equal(got[:at], original[:at]) &&
+			bytes.Equal(got[at:at+len(inserted)], inserted) &&
+			bytes.Equal(got[at+len(inserted):], original[at:]) {
+			return true
 		}
 	}
-	return len(want) == 0
+	return false
 }
