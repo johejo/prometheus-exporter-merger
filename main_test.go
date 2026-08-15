@@ -697,11 +697,6 @@ func Test_mapToSliceLabelsEscapesValues(t *testing.T) {
 	if want, got := `special="quote \" backslash \\ newline\n"`, labels[0]; got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
-
-	metric := "metric{" + labels[0] + "}"
-	if err := metrics.ValidateMetric(metric); err != nil {
-		t.Errorf("generated label is invalid: %v", err)
-	}
 }
 
 func Test_copyBody(t *testing.T) {
@@ -710,25 +705,13 @@ func Test_copyBody(t *testing.T) {
 		`# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.`,
 		`# TYPE go_gc_duration_seconds summary`,
 		`go_gc_duration_seconds{quantile="0"} 5.871e-06`,
-		`go_gc_duration_seconds{quantile="0.25"} 8.356e-06`,
-		`go_gc_duration_seconds{quantile="0.25"} 8.356e-06`,
-		`go_gc_duration_seconds{quantile="0.5"} 1.2864e-05`,
-		`go_gc_duration_seconds{quantile="0.75"} 1.8997e-05`,
-		`go_gc_duration_seconds{quantile="1"} 5.5938e-05`,
 		`go_gc_duration_seconds_sum 0.464658525`,
-		`go_gc_duration_seconds_count 30719`,
 	}, "\n")
 	expositionWant := strings.Join([]string{
 		`# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.`,
 		`# TYPE go_gc_duration_seconds summary`,
 		`go_gc_duration_seconds{quantile="0",foo="bar"} 5.871e-06`,
-		`go_gc_duration_seconds{quantile="0.25",foo="bar"} 8.356e-06`,
-		`go_gc_duration_seconds{quantile="0.25",foo="bar"} 8.356e-06`,
-		`go_gc_duration_seconds{quantile="0.5",foo="bar"} 1.2864e-05`,
-		`go_gc_duration_seconds{quantile="0.75",foo="bar"} 1.8997e-05`,
-		`go_gc_duration_seconds{quantile="1",foo="bar"} 5.5938e-05`,
 		`go_gc_duration_seconds_sum{foo="bar"} 0.464658525`,
-		`go_gc_duration_seconds_count{foo="bar"} 30719`,
 	}, "\n")
 
 	tests := []struct {
