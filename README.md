@@ -15,8 +15,9 @@ Provides the feature to merge multiple upstream exporters into a single exporter
 
 ## Self metrics
 
-The self-metrics listener exposes the following per-upstream metrics in addition to process metrics:
+The self-metrics listener exposes build information and the following per-upstream metrics in addition to process metrics:
 
+- `exporter_merger_build_info{version}`
 - `exporter_merger_upstream_requests_total{listener,upstream}`
 - `exporter_merger_upstream_request_failures_total{listener,upstream}`
 - `exporter_merger_upstream_request_duration_seconds{listener,upstream}`

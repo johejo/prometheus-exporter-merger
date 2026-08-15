@@ -55,6 +55,7 @@ func main() {
 
 	initLogger(*logLevel, *logFormat)
 	metrics.ExposeMetadata(*selfMetricsExposeMetdata)
+	registerBuildInfoMetric()
 
 	cfg, err := loadConfig(*config, *expandEnv)
 	if err != nil {
@@ -85,6 +86,11 @@ func currentVersion() string {
 		return "unknown"
 	}
 	return buildInfo.Main.Version
+}
+
+func registerBuildInfoMetric() {
+	metricName := "exporter_merger_build_info{" + formatLabel("version", currentVersion()) + "}"
+	metrics.GetOrCreateGauge(metricName, func() float64 { return 1 })
 }
 
 type Config map[string]ListenerConfig
