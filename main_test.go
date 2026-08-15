@@ -846,46 +846,33 @@ func Fuzz_writeLine(f *testing.F) {
 	})
 }
 
-func Fuzz_writeLineValidSamples(f *testing.F) {
-	f.Add([]byte("seed"), uint8(0))
-	f.Add([]byte{0x00, 0xff}, uint8(15))
-	f.Add([]byte("empty labels"), uint8(30))
-	f.Add([]byte("quoted brace"), uint8(45))
-
-	extraLabels := []byte(`fuzz_label="value"`)
-	f.Fuzz(func(t *testing.T, suffix []byte, shape uint8) {
-		name := fmt.Sprintf("metric_%x", suffix)
-		separator := []string{" ", "\t", "  "}[int(shape)%3]
-		value := []string{"1", "-1.5e-3", "NaN", "+Inf", "-Inf"}[int(shape/3)%5]
-
-		var line, want string
-		switch shape / 15 % 4 {
-		case 0:
-			line = name + separator + value
-			want = name + `{fuzz_label="value"}` + separator + value
-		case 1:
-			line = name + `{existing="value"}` + separator + value
-			want = name + `{existing="value",fuzz_label="value"}` + separator + value
-		case 2:
-			line = name + `{}` + separator + value
-			want = name + `{fuzz_label="value"}` + separator + value
-		case 3:
-			line = name + `{existing="}"}` + separator + value
-			want = name + `{existing="}",fuzz_label="value"}` + separator + value
+func Test_writeLineValidSamples(t *testing.T) {
+	const name = "metric_name"
+	extraLabels := []byte(`extra_label="value"`)
+	labelSets := []struct {
+		input string
+		want  string
+	}{
+		{want: `{extra_label="value"}`},
+		{input: `{existing="value"}`, want: `{existing="value",extra_label="value"}`},
+		{input: `{}`, want: `{extra_label="value"}`},
+		{input: `{existing="}"}`, want: `{existing="}",extra_label="value"}`},
+	}
+	for _, labels := range labelSets {
+		for _, separator := range []string{" ", "\t", "  "} {
+			for _, value := range []string{"1", "-1.5e-3", "NaN", "+Inf", "-Inf"} {
+				for _, timestamp := range []string{"", " 123"} {
+					for _, newline := range []string{"", "\n"} {
+						line := name + labels.input + separator + value + timestamp + newline
+						want := name + labels.want + separator + value + timestamp + newline
+						if got := string(writeLineOutput([]byte(line), extraLabels)); got != want {
+							t.Fatalf("want %q, got %q", want, got)
+						}
+					}
+				}
+			}
 		}
-		if shape&0x40 != 0 {
-			line += " 123"
-			want += " 123"
-		}
-		if shape&0x80 != 0 {
-			line += "\n"
-			want += "\n"
-		}
-
-		if got := string(writeLineOutput([]byte(line), extraLabels)); got != want {
-			t.Fatalf("want %q, got %q", want, got)
-		}
-	})
+	}
 }
 
 func isSingleInsertion(original, got, inserted []byte) bool {
