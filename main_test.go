@@ -283,19 +283,9 @@ func TestHandler(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	handler("", cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	body := rec.Body.String()
-
-	if want, got := 4, countLines(body); want != got {
-		t.Errorf("duplicate metadata should be omitted: want=%d, got=%d", want, got)
-	}
-	if want, got := 1, strings.Count(body, "# HELP metric documentation"); want != got {
-		t.Errorf("HELP should occur once: want=%d, got=%d", want, got)
-	}
-	if want, got := 1, strings.Count(body, "# TYPE metric gauge"); want != got {
-		t.Errorf("TYPE should occur once: want=%d, got=%d", want, got)
-	}
-	if want, got := 2, strings.Count(body, `metric{foo="bar"} 1`); want != got {
-		t.Errorf("all samples should contain common labels: want=%d, got=%d", want, got)
+	want := "# HELP metric documentation\n# TYPE metric gauge\nmetric{foo=\"bar\"} 1\nmetric{foo=\"bar\"} 1\n"
+	if got := rec.Body.String(); got != want {
+		t.Errorf("response body: got %q, want %q", got, want)
 	}
 }
 
@@ -697,16 +687,6 @@ func (r *blockingBody) Read(p []byte) (int, error) {
 	r.once.Do(func() { close(r.started) })
 	<-r.release
 	return r.trackingBody.Read(p)
-}
-
-func countLines(s string) int {
-	n := 0
-	for _, line := range strings.Split(s, "\n") {
-		if len(line) != 0 {
-			n++
-		}
-	}
-	return n
 }
 
 func Test_mapToSliceLabelsEscapesValues(t *testing.T) {
