@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -20,7 +21,79 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
+	"github.com/klauspost/compress/zstd"
 )
+
+func TestResponseCompression(t *testing.T) {
+	wrapper, err := newCompressionWrapper()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Repeat("metric 1\n", 256)
+	h := wrapper(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+
+	t.Run("prefers gzip", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		req.Header.Set("Accept-Encoding", "gzip, zstd")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if got, want := rec.Header().Get("Content-Encoding"), "gzip"; got != want {
+			t.Fatalf("Content-Encoding: got %q, want %q", got, want)
+		}
+		zr, err := gzip.NewReader(rec.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := zr.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != body {
+			t.Error("decompressed response differs from the original")
+		}
+	})
+
+	t.Run("supports zstd", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		req.Header.Set("Accept-Encoding", "zstd")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if got, want := rec.Header().Get("Content-Encoding"), "zstd"; got != want {
+			t.Fatalf("Content-Encoding: got %q, want %q", got, want)
+		}
+		zr, err := zstd.NewReader(rec.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer zr.Close()
+		got, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != body {
+			t.Error("decompressed response differs from the original")
+		}
+	})
+
+	t.Run("identity", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+		if got := rec.Header().Get("Content-Encoding"); got != "" {
+			t.Fatalf("Content-Encoding: got %q, want none", got)
+		}
+		if got := rec.Body.String(); got != body {
+			t.Error("response differs from the original")
+		}
+	})
+}
 
 func TestServeServerGracefulShutdown(t *testing.T) {
 	started := make(chan struct{})

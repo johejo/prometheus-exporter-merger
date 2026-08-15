@@ -25,6 +25,7 @@ import (
 
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goccy/go-yaml"
+	"github.com/klauspost/compress/gzhttp"
 )
 
 const (
@@ -229,6 +230,11 @@ type listenerServer struct {
 }
 
 func run(ctx context.Context, cfg Config, selfMetricsAddress string) error {
+	compressionWrapper, err := newCompressionWrapper()
+	if err != nil {
+		return fmt.Errorf("initialize HTTP response compression: %w", err)
+	}
+
 	type listenerSpec struct {
 		name    string
 		address string
@@ -257,7 +263,7 @@ func run(ctx context.Context, cfg Config, selfMetricsAddress string) error {
 		}
 		servers = append(servers, listenerServer{
 			name:     spec.name,
-			server:   &http.Server{Handler: mux},
+			server:   &http.Server{Handler: compressionWrapper(mux)},
 			listener: listener,
 		})
 	}
@@ -282,6 +288,13 @@ func run(ctx context.Context, cfg Config, selfMetricsAddress string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func newCompressionWrapper() (func(http.Handler) http.HandlerFunc, error) {
+	return gzhttp.NewWrapper(
+		gzhttp.CompressionLevel(1),
+		gzhttp.PreferZstd(false),
+	)
 }
 
 func serveServer(ctx context.Context, server listenerServer) error {

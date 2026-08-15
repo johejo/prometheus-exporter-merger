@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/VictoriaMetrics/metrics v1.44.0
 	github.com/goccy/go-yaml v1.19.2
+	github.com/klauspost/compress v1.19.2
 )
 
 require (
