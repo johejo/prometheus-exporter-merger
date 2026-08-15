@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +21,72 @@ import (
 
 	"github.com/VictoriaMetrics/metrics"
 )
+
+func TestServeServerGracefulShutdown(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = io.WriteString(w, "complete")
+	})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := listenerServer{
+		name:     "test",
+		server:   &http.Server{Handler: handler},
+		listener: listener,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveServer(ctx, server) }()
+
+	requested := make(chan struct{})
+	go func() {
+		defer close(requested)
+		client := &http.Client{Transport: &http.Transport{}}
+		resp, err := client.Get("http://" + listener.Addr().String())
+		if err != nil {
+			t.Errorf("request failed: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Errorf("failed reading response: %v", err)
+			return
+		}
+		if got, want := string(body), "complete"; got != want {
+			t.Errorf("response body: got %q, want %q", got, want)
+		}
+	}()
+
+	select {
+	case <-started:
+	case <-requested:
+		t.Fatal("request did not start")
+	case <-time.After(time.Second):
+		t.Fatal("request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("server stopped before active request completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case <-requested:
+	case <-time.After(time.Second):
+		t.Fatal("request did not complete")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("serveServer returned an error: %v", err)
+	}
+}
 
 func TestHandler(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -35,7 +103,7 @@ func TestHandler(t *testing.T) {
 		CommonLabels: map[string]string{"foo": "bar"},
 	}
 	rec := httptest.NewRecorder()
-	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	handler("", cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 
 	if want, got := 4, countLines(body); want != got {
@@ -54,7 +122,7 @@ func TestHandler(t *testing.T) {
 
 func TestHandlerClosesAllResponseBodiesAfterCopyError(t *testing.T) {
 	readErr := errors.New("read failed")
-	bodies := map[string]*trackingReadCloser{
+	bodies := map[string]*trackingBody{
 		"first":  {Reader: iotest.ErrReader(readErr)},
 		"second": {Reader: iotest.ErrReader(readErr)},
 	}
@@ -74,9 +142,7 @@ func TestHandlerClosesAllResponseBodiesAfterCopyError(t *testing.T) {
 		}, nil
 	})
 
-	originalHTTPClient := httpClient
-	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
-	t.Cleanup(func() { httpClient = originalHTTPClient })
+	stubHTTPClient(t, transport)
 
 	cfg := ListenerConfig{
 		Path: "/metrics",
@@ -85,7 +151,7 @@ func TestHandlerClosesAllResponseBodiesAfterCopyError(t *testing.T) {
 			"second": {URI: "http://second"},
 		},
 	}
-	handler(cfg).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	handler("", cfg).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	for name, body := range bodies {
 		if !body.closed.Load() {
@@ -113,13 +179,10 @@ func TestHandlerChecksAllHeadersBeforeWritingBodies(t *testing.T) {
 		}, nil
 	})
 
-	originalHTTPClient := httpClient
-	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
-	t.Cleanup(func() { httpClient = originalHTTPClient })
+	stubHTTPClient(t, transport)
 
 	cfg := ListenerConfig{
 		Path: "/metrics",
-		name: "header-check-test",
 		Exporters: map[string]Exporter{
 			"success": {URI: "http://success"},
 			"failure": {URI: "http://failure"},
@@ -130,7 +193,7 @@ func TestHandlerChecksAllHeadersBeforeWritingBodies(t *testing.T) {
 	)
 	before := failures.Get()
 	rec := httptest.NewRecorder()
-	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	handler("header-check-test", cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	if got, want := rec.Code, http.StatusBadGateway; got != want {
 		t.Errorf("status: got %d, want %d", got, want)
@@ -151,20 +214,17 @@ func TestHandlerAppliesUpstreamTimeout(t *testing.T) {
 		<-req.Context().Done()
 		return nil, req.Context().Err()
 	})
-	originalHTTPClient := httpClient
-	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
-	t.Cleanup(func() { httpClient = originalHTTPClient })
+	stubHTTPClient(t, transport)
 
 	cfg := ListenerConfig{
 		Path: "/metrics",
-		name: "timeout-test",
 		Exporters: map[string]Exporter{
 			"slow": {URI: "http://slow", Timeout: 10 * time.Millisecond},
 		},
 	}
 	started := time.Now()
 	rec := httptest.NewRecorder()
-	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	handler("timeout-test", cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	if got, want := rec.Code, http.StatusBadGateway; got != want {
 		t.Errorf("status: got %d, want %d", got, want)
@@ -182,13 +242,10 @@ func TestHandlerCancelsOtherUpstreamsAfterFailure(t *testing.T) {
 		<-req.Context().Done()
 		return nil, req.Context().Err()
 	})
-	originalHTTPClient := httpClient
-	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
-	t.Cleanup(func() { httpClient = originalHTTPClient })
+	stubHTTPClient(t, transport)
 
 	cfg := ListenerConfig{
 		Path: "/metrics",
-		name: "cancel-test",
 		Exporters: map[string]Exporter{
 			"failure": {URI: "http://failure"},
 			"waiting": {URI: "http://waiting"},
@@ -199,7 +256,7 @@ func TestHandlerCancelsOtherUpstreamsAfterFailure(t *testing.T) {
 	)
 	before := waitingFailures.Get()
 	rec := httptest.NewRecorder()
-	handler(cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	handler("cancel-test", cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	if got, want := rec.Code, http.StatusBadGateway; got != want {
 		t.Errorf("status: got %d, want %d", got, want)
@@ -318,18 +375,15 @@ func TestHandlerRecordsUpstreamDuration(t *testing.T) {
 			Request:    req,
 		}, nil
 	})
-	originalHTTPClient := httpClient
-	httpClient = func() *http.Client { return &http.Client{Transport: transport} }
-	t.Cleanup(func() { httpClient = originalHTTPClient })
+	stubHTTPClient(t, transport)
 
 	cfg := ListenerConfig{
 		Path: "/metrics",
-		name: "duration-test",
 		Exporters: map[string]Exporter{
 			"success": {URI: "http://success"},
 		},
 	}
-	handler(cfg).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	handler("duration-test", cfg).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	var output bytes.Buffer
 	metrics.WritePrometheus(&output, false)
@@ -349,9 +403,10 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-type trackingReadCloser struct {
-	io.Reader
-	closed atomic.Bool
+func stubHTTPClient(t *testing.T, rt http.RoundTripper) {
+	original := httpClient
+	httpClient = &http.Client{Transport: rt}
+	t.Cleanup(func() { httpClient = original })
 }
 
 type trackingBody struct {
@@ -366,11 +421,6 @@ func (r *trackingBody) Read(p []byte) (int, error) {
 }
 
 func (r *trackingBody) Close() error {
-	r.closed.Store(true)
-	return nil
-}
-
-func (r *trackingReadCloser) Close() error {
 	r.closed.Store(true)
 	return nil
 }
@@ -403,7 +453,7 @@ func Test_mapToSliceLabelsEscapesValues(t *testing.T) {
 }
 
 func Test_copyBody(t *testing.T) {
-	longValue := strings.Repeat("x", 2*readBufferSize)
+	longValue := strings.Repeat("x", 2*bufferSize)
 	exposition := strings.Join([]string{
 		`# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.`,
 		`# TYPE go_gc_duration_seconds summary`,

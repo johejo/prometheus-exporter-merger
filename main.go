@@ -10,22 +10,30 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goccy/go-yaml"
 )
 
+const (
+	shutdownTimeout = 10 * time.Second
+	selfMetricsName = "self metrics"
+)
+
 var (
-	httpClient               = func() *http.Client { return http.DefaultClient }
+	httpClient               = http.DefaultClient
 	logLevel                 = flag.String("log-level", "info", "logging level: debug, info, warn, error")
 	config                   = flag.String("config", "config.yaml", "configuration file path")
 	expandEnv                = flag.Bool("expand-env", false, "expand environment variables in config")
@@ -37,6 +45,7 @@ func main() {
 	flag.Parse()
 
 	initLogger(*logLevel)
+	metrics.ExposeMetadata(*selfMetricsExposeMetdata)
 
 	cfg, err := loadConfig(*config, *expandEnv)
 	if err != nil {
@@ -50,47 +59,27 @@ func main() {
 
 	slog.Info("config loaded", "config", *config)
 
-	var wg sync.WaitGroup
-	wg.Add(len(*cfg))
-	for name, lc := range *cfg {
-		go func() {
-			defer wg.Done()
-			lc.name = name
-			slog.Info("start", "name", name, "address", lc.Address)
-			if err := serve(lc); err != nil {
-				slog.Error(err.Error())
-			}
-		}()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, *cfg, *selfMetricsAddress); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
 	}
-	wg.Add(1)
-	go func() {
-		slog.Info("listening self metrics", "address", *selfMetricsAddress)
-		mux := http.NewServeMux()
-		metrics.ExposeMetadata(*selfMetricsExposeMetdata)
-		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-			metrics.WritePrometheus(w, true)
-		})
-		if err := http.ListenAndServe(*selfMetricsAddress, mux); err != nil {
-			slog.Error(err.Error())
-		}
-	}()
-	wg.Wait()
 }
 
 type Config map[string]ListenerConfig
 
 type ListenerConfig struct {
-	Address      string              `json:"address" yaml:"address"`
-	Path         string              `json:"path" yaml:"path"`
-	Exporters    map[string]Exporter `json:"exporters" yaml:"exporters"`
-	CommonLabels map[string]string   `json:"commonLabels" yaml:"commonLabels"`
-	name         string
+	Address      string              `yaml:"address"`
+	Path         string              `yaml:"path"`
+	Exporters    map[string]Exporter `yaml:"exporters"`
+	CommonLabels map[string]string   `yaml:"commonLabels"`
 }
 
 type Exporter struct {
-	URI     string            `json:"uri" yaml:"uri"`
-	Timeout time.Duration     `json:"timeout" yaml:"timeout"`
-	Labels  map[string]string `json:"labels" yaml:"labels"`
+	URI     string            `yaml:"uri"`
+	Timeout time.Duration     `yaml:"timeout"`
+	Labels  map[string]string `yaml:"labels"`
 }
 
 func initLogger(loglevel string) {
@@ -142,13 +131,11 @@ func validateConfig(cfg Config, selfMetricsAddress string) error {
 	if len(cfg) == 0 {
 		errs = append(errs, errors.New("at least one listener is required"))
 	}
+	addresses := make(map[string]string, len(cfg))
 	if selfMetricsAddress == "" {
 		errs = append(errs, errors.New("self metrics address must not be empty"))
-	}
-
-	addresses := make(map[string]string, len(cfg))
-	if selfMetricsAddress != "" {
-		addresses[selfMetricsAddress] = "self metrics"
+	} else {
+		addresses[selfMetricsAddress] = selfMetricsName
 	}
 	for _, name := range slices.Sorted(maps.Keys(cfg)) {
 		listener := cfg[name]
@@ -235,10 +222,98 @@ func validLabelName(name string) bool {
 	return name != "" && metricNameEnd([]byte(name)) == len(name) && !strings.Contains(name, ":")
 }
 
-func serve(cfg ListenerConfig) error {
-	mux := http.NewServeMux()
-	mux.Handle(cfg.Path, handler(cfg))
-	return http.ListenAndServe(cfg.Address, mux)
+type listenerServer struct {
+	name     string
+	server   *http.Server
+	listener net.Listener
+}
+
+func run(ctx context.Context, cfg Config, selfMetricsAddress string) error {
+	type listenerSpec struct {
+		name    string
+		address string
+		path    string
+		handler http.Handler
+	}
+	specs := make([]listenerSpec, 0, len(cfg)+1)
+	for name, listenerCfg := range cfg {
+		specs = append(specs, listenerSpec{name, listenerCfg.Address, listenerCfg.Path, handler(name, listenerCfg)})
+	}
+	specs = append(specs, listenerSpec{selfMetricsName, selfMetricsAddress, "/metrics",
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			metrics.WritePrometheus(w, true)
+		})})
+
+	servers := make([]listenerServer, 0, len(specs))
+	for _, spec := range specs {
+		mux := http.NewServeMux()
+		mux.Handle(spec.path, spec.handler)
+		listener, err := net.Listen("tcp", spec.address)
+		if err != nil {
+			for _, server := range servers {
+				_ = server.listener.Close()
+			}
+			return fmt.Errorf("listen %s on %s: %w", spec.name, spec.address, err)
+		}
+		servers = append(servers, listenerServer{
+			name:     spec.name,
+			server:   &http.Server{Handler: mux},
+			listener: listener,
+		})
+	}
+
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, len(servers))
+	for _, server := range servers {
+		go func() {
+			slog.Info("listening", "name", server.name, "address", server.listener.Addr())
+			results <- serveServer(serveCtx, server)
+		}()
+	}
+
+	// One listener failing makes the process useless, so stop the others too, but
+	// report every failure rather than only the one that arrived first.
+	var errs []error
+	for range servers {
+		if err := <-results; err != nil {
+			errs = append(errs, err)
+			cancel()
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func serveServer(ctx context.Context, server listenerServer) error {
+	// Serve reports ErrServerClosed once Shutdown or Close has been called.
+	wrapServe := func(err error) error {
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("serve %s: %w", server.name, err)
+	}
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- server.server.Serve(server.listener)
+	}()
+
+	select {
+	case err := <-errs:
+		return wrapServe(err)
+	case <-ctx.Done():
+	}
+
+	slog.Info("shutting down", "name", server.name)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	shutdownErr := server.server.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		// Shutdown leaves active connections open when its deadline expires.
+		_ = server.server.Close()
+		shutdownErr = fmt.Errorf("shut down %s: %w", server.name, shutdownErr)
+	}
+	return errors.Join(shutdownErr, wrapServe(<-errs))
 }
 
 type target struct {
@@ -259,16 +334,12 @@ type fetchResult struct {
 	err     error
 }
 
-func handler(cfg ListenerConfig) http.HandlerFunc {
+func handler(name string, cfg ListenerConfig) http.HandlerFunc {
 	targets := make([]target, 0, len(cfg.Exporters))
-	for name, e := range cfg.Exporters {
-		metricLabels := fmt.Sprintf(
-			`listener="%s",upstream="%s"`,
-			labelValueEscaper.Replace(cfg.name),
-			labelValueEscaper.Replace(name),
-		)
+	for exporterName, e := range cfg.Exporters {
+		metricLabels := formatLabel("listener", name) + "," + formatLabel("upstream", exporterName)
 		targets = append(targets, target{
-			name:    name,
+			name:    exporterName,
 			uri:     e.URI,
 			timeout: e.Timeout,
 			extra: []byte(strings.Join(append(
@@ -292,7 +363,7 @@ func handler(cfg ListenerConfig) http.HandlerFunc {
 
 		results := make(chan fetchResult, len(targets))
 		for _, t := range targets {
-			go fetch(ctx, t, results)
+			go func() { results <- fetch(ctx, t) }()
 		}
 
 		// Do not copy any body until every upstream has returned its headers. This
@@ -317,32 +388,31 @@ func handler(cfg ListenerConfig) http.HandlerFunc {
 			fetched = append(fetched, result)
 		}
 		if failed {
-			for i := range fetched {
-				fetched[i].close()
-			}
+			closeAll(fetched)
 			http.Error(w, "failed to fetch upstream exporters", http.StatusBadGateway)
 			return
 		}
 
-		bw := bufio.NewWriter(w)
+		bw := writerPool.Get().(*bufio.Writer)
+		defer func() {
+			bw.Reset(nil) // drop the ResponseWriter and any unflushed bytes
+			writerPool.Put(bw)
+		}()
+		bw.Reset(w)
 		seenMetadata := make(map[string]struct{})
-		var copyErr error
 		for i := range fetched {
 			result := &fetched[i]
-			if copyErr == nil {
-				slog.Debug("start copying body with merging labels", "name", result.target.name)
-				if copyErr = copyBody(bw, result.body, result.target.extra, seenMetadata); copyErr != nil {
-					result.target.failures.Inc()
-					slog.Error("failed reading upstream response", "name", result.target.name, "uri", result.target.uri, "error", copyErr)
-					cancel()
-				} else {
-					slog.Debug("finish copying body", "name", result.target.name)
-				}
-			}
+			slog.Debug("start copying body with merging labels", "name", result.target.name)
+			err := copyBody(bw, result.body, result.target.extra, seenMetadata)
 			result.close()
-		}
-		if copyErr != nil {
-			return
+			if err != nil {
+				result.target.failures.Inc()
+				slog.Error("failed reading upstream response", "name", result.target.name, "uri", result.target.uri, "error", err)
+				cancel()
+				closeAll(fetched[i+1:])
+				return
+			}
+			slog.Debug("finish copying body", "name", result.target.name)
 		}
 		if err := bw.Flush(); err != nil {
 			slog.Error(err.Error())
@@ -350,10 +420,9 @@ func handler(cfg ListenerConfig) http.HandlerFunc {
 	}
 }
 
-func fetch(ctx context.Context, t target, results chan<- fetchResult) {
+func fetch(ctx context.Context, t target) fetchResult {
 	result := fetchResult{target: t, started: time.Now()}
 	requestCtx := ctx
-	result.cancel = func() {}
 	if t.timeout > 0 {
 		requestCtx, result.cancel = context.WithTimeout(ctx, t.timeout)
 	}
@@ -362,14 +431,12 @@ func fetch(ctx context.Context, t target, results chan<- fetchResult) {
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, t.uri, nil)
 	if err != nil {
 		result.err = err
-		results <- result
-		return
+		return result
 	}
-	resp, err := httpClient().Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		result.err = err
-		results <- result
-		return
+		return result
 	}
 	result.body = resp.Body
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -377,7 +444,13 @@ func fetch(ctx context.Context, t target, results chan<- fetchResult) {
 	} else {
 		slog.Debug("received upstream headers", "name", t.name, "status", resp.Status)
 	}
-	results <- result
+	return result
+}
+
+func closeAll(fetched []fetchResult) {
+	for i := range fetched {
+		fetched[i].close()
+	}
 }
 
 func (r *fetchResult) close() {
@@ -386,7 +459,9 @@ func (r *fetchResult) close() {
 			slog.Debug("failed closing upstream response", "name", r.target.name, "error", err)
 		}
 	}
-	r.cancel()
+	if r.cancel != nil {
+		r.cancel()
+	}
 	r.target.requests.Inc()
 	r.target.duration.UpdateDuration(r.started)
 }
@@ -397,22 +472,38 @@ var labelValueEscaper = strings.NewReplacer(
 	`"`, `\"`,
 )
 
+func formatLabel(name, value string) string {
+	return fmt.Sprintf(`%s="%s"`, name, labelValueEscaper.Replace(value))
+}
+
 func mapToSliceLabels(m map[string]string) []string {
 	s := make([]string, 0, len(m))
 	for k, v := range m {
-		s = append(s, fmt.Sprintf(`%s="%s"`, k, labelValueEscaper.Replace(v)))
+		s = append(s, formatLabel(k, v))
 	}
 	slices.Sort(s) // map iteration order would make the output unstable
 	return s
 }
 
-// readBufferSize is large enough that a whole exposition line practically always
+// bufferSize is large enough that a whole exposition line practically always
 // fits, which keeps copyBody on its zero-copy path.
-const readBufferSize = 64 << 10
+const bufferSize = 64 << 10
+
+// Buffers are pooled because a merge allocates one reader per upstream and one
+// writer per request, which would otherwise dominate the garbage a scrape makes.
+var (
+	readerPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, bufferSize) }}
+	writerPool = sync.Pool{New: func() any { return bufio.NewWriterSize(nil, bufferSize) }}
+)
 
 // seenMetadata is shared across bodies so the first HELP and TYPE definitions win.
 func copyBody(w *bufio.Writer, body io.Reader, extraLabels []byte, seenMetadata map[string]struct{}) error {
-	r := bufio.NewReaderSize(body, readBufferSize)
+	r := readerPool.Get().(*bufio.Reader)
+	defer func() {
+		r.Reset(nil) // do not let the pool keep the body alive
+		readerPool.Put(r)
+	}()
+	r.Reset(body)
 	// ReadSlice returns a view into r's buffer, so no per-line allocation. Only a
 	// line too long to fit gets assembled into joined, which is reused after that.
 	var joined []byte
