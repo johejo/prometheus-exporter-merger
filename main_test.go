@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +53,81 @@ func TestCurrentVersion(t *testing.T) {
 			t.Fatalf("currentVersion() = %q, want %q", got, want)
 		}
 	})
+}
+
+func TestLogFormat(t *testing.T) {
+	if got, want := *logFormat, "text"; got != want {
+		t.Fatalf("default log format = %q, want %q", got, want)
+	}
+
+	tests := []struct {
+		name   string
+		format string
+		check  func(*testing.T, []byte)
+	}{
+		{
+			name:   "text",
+			format: "text",
+			check: func(t *testing.T, output []byte) {
+				t.Helper()
+				got := string(output)
+				for _, want := range []string{"level=INFO", `msg="format test"`, "answer=42"} {
+					if !strings.Contains(got, want) {
+						t.Fatalf("text log does not contain %q: %s", want, got)
+					}
+				}
+			},
+		},
+		{
+			name:   "json",
+			format: "json",
+			check: func(t *testing.T, output []byte) {
+				t.Helper()
+				var entry map[string]any
+				if err := json.Unmarshal(output, &entry); err != nil {
+					t.Fatalf("log is not valid JSON: %v\n%s", err, output)
+				}
+				if got, want := entry["level"], "INFO"; got != want {
+					t.Errorf("level = %v, want %v", got, want)
+				}
+				if got, want := entry["msg"], "format test"; got != want {
+					t.Errorf("msg = %v, want %v", got, want)
+				}
+				if got, want := entry["answer"], float64(42); got != want {
+					t.Errorf("answer = %v, want %v", got, want)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalLogger := slog.Default()
+			originalStderr := os.Stderr
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				slog.SetDefault(originalLogger)
+				os.Stderr = originalStderr
+				_ = r.Close()
+				_ = w.Close()
+			})
+
+			os.Stderr = w
+			initLogger("info", tt.format)
+			slog.Info("format test", "answer", 42)
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			output, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.check(t, output)
+		})
+	}
 }
 
 func TestResponseCompression(t *testing.T) {

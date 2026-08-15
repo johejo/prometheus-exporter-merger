@@ -37,6 +37,8 @@ Usage of prometheus-exporter-merger:
         configuration file path (default "config.yaml")
   -expand-env
         expand environment variables in config
+  -log-format string
+        logging format: text, json (default "text")
   -log-level string
         logging level: debug, info, warn, error (default "info")
   -self-metrics-address string

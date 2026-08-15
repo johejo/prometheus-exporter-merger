@@ -39,6 +39,7 @@ var (
 	showVersion              = flag.Bool("version", false, "print version and exit")
 	httpClient               = http.DefaultClient
 	logLevel                 = flag.String("log-level", "info", "logging level: debug, info, warn, error")
+	logFormat                = flag.String("log-format", "text", "logging format: text, json")
 	config                   = flag.String("config", "config.yaml", "configuration file path")
 	expandEnv                = flag.Bool("expand-env", false, "expand environment variables in config")
 	selfMetricsAddress       = flag.String("self-metrics-address", ":9716", "listen address for self metrics")
@@ -52,7 +53,7 @@ func main() {
 		return
 	}
 
-	initLogger(*logLevel)
+	initLogger(*logLevel, *logFormat)
 	metrics.ExposeMetadata(*selfMetricsExposeMetdata)
 
 	cfg, err := loadConfig(*config, *expandEnv)
@@ -101,7 +102,7 @@ type Exporter struct {
 	Labels  map[string]string `yaml:"labels"`
 }
 
-func initLogger(loglevel string) {
+func initLogger(loglevel, logformat string) {
 	slogLevel := slog.LevelInfo
 	switch strings.ToLower(loglevel) {
 	case "debug":
@@ -114,7 +115,7 @@ func initLogger(loglevel string) {
 		slogLevel = slog.LevelError
 	}
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	handlerOptions := &slog.HandlerOptions{
 		AddSource: true,
 		Level:     slogLevel,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
@@ -124,8 +125,16 @@ func initLogger(loglevel string) {
 				}
 			}
 			return a
-		}},
-	)))
+		},
+	}
+
+	var handler slog.Handler
+	if strings.EqualFold(logformat, "json") {
+		handler = slog.NewJSONHandler(os.Stderr, handlerOptions)
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, handlerOptions)
+	}
+	slog.SetDefault(slog.New(handler))
 }
 
 func loadConfig(config string, expandEnv bool) (*Config, error) {
