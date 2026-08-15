@@ -593,9 +593,9 @@ func Test_mapToSliceLabelsEscapesValues(t *testing.T) {
 		t.Errorf("want %q, got %q", want, got)
 	}
 
-	line := []byte("metric{" + labels[0] + "} 1\n")
-	if _, _, _, ok := labelInsertPoint(line); !ok {
-		t.Errorf("generated label cannot be parsed: %q", line)
+	metric := "metric{" + labels[0] + "}"
+	if err := metrics.ValidateMetric(metric); err != nil {
+		t.Errorf("generated label is invalid: %v", err)
 	}
 }
 
@@ -726,6 +726,48 @@ func Fuzz_writeLine(f *testing.F) {
 		}
 		if delta := len(got) - len(original); delta < 0 || delta > len(extraLabels)+2 {
 			t.Fatalf("unexpected output length change: input=%q output=%q", original, got)
+		}
+	})
+}
+
+func Fuzz_writeLineValidSamples(f *testing.F) {
+	f.Add([]byte("seed"), uint8(0))
+	f.Add([]byte{0x00, 0xff}, uint8(15))
+	f.Add([]byte("empty labels"), uint8(30))
+	f.Add([]byte("quoted brace"), uint8(45))
+
+	extraLabels := []byte(`fuzz_label="value"`)
+	f.Fuzz(func(t *testing.T, suffix []byte, shape uint8) {
+		name := fmt.Sprintf("metric_%x", suffix)
+		separator := []string{" ", "\t", "  "}[int(shape)%3]
+		value := []string{"1", "-1.5e-3", "NaN", "+Inf", "-Inf"}[int(shape/3)%5]
+
+		var line, want string
+		switch shape / 15 % 4 {
+		case 0:
+			line = name + separator + value
+			want = name + `{fuzz_label="value"}` + separator + value
+		case 1:
+			line = name + `{existing="value"}` + separator + value
+			want = name + `{existing="value",fuzz_label="value"}` + separator + value
+		case 2:
+			line = name + `{}` + separator + value
+			want = name + `{fuzz_label="value"}` + separator + value
+		case 3:
+			line = name + `{existing="}"}` + separator + value
+			want = name + `{existing="}",fuzz_label="value"}` + separator + value
+		}
+		if shape&0x40 != 0 {
+			line += " 123"
+			want += " 123"
+		}
+		if shape&0x80 != 0 {
+			line += "\n"
+			want += "\n"
+		}
+
+		if got := string(writeLineOutput([]byte(line), extraLabels)); got != want {
+			t.Fatalf("want %q, got %q", want, got)
 		}
 	})
 }
