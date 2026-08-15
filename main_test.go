@@ -389,9 +389,12 @@ func TestHandlerChecksAllHeadersBeforeWritingBodies(t *testing.T) {
 }
 
 func TestHandlerAppliesUpstreamTimeout(t *testing.T) {
+	upstreamErr := make(chan error, 1)
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		<-req.Context().Done()
-		return nil, req.Context().Err()
+		err := req.Context().Err()
+		upstreamErr <- err
+		return nil, err
 	})
 	stubHTTPClient(t, transport)
 
@@ -401,23 +404,25 @@ func TestHandlerAppliesUpstreamTimeout(t *testing.T) {
 			"slow": {URI: "http://slow", Timeout: 10 * time.Millisecond},
 		},
 	}
-	started := time.Now()
 	rec := httptest.NewRecorder()
-	handler("timeout-test", cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	serveHTTPWithinDeadline(t, handler("timeout-test", cfg), rec)
 
 	if got, want := rec.Code, http.StatusBadGateway; got != want {
 		t.Errorf("status: got %d, want %d", got, want)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Errorf("upstream timeout took too long: %s", elapsed)
+	if err := <-upstreamErr; !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("upstream error: got %v, want context deadline exceeded", err)
 	}
 }
 
 func TestHandlerCancelsOtherUpstreamsAfterFailure(t *testing.T) {
+	waitingStarted := make(chan struct{})
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Host == "failure" {
+			<-waitingStarted
 			return nil, errors.New("connection failed")
 		}
+		close(waitingStarted)
 		<-req.Context().Done()
 		return nil, req.Context().Err()
 	})
@@ -435,7 +440,7 @@ func TestHandlerCancelsOtherUpstreamsAfterFailure(t *testing.T) {
 	)
 	before := waitingFailures.Get()
 	rec := httptest.NewRecorder()
-	handler("cancel-test", cfg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	serveHTTPWithinDeadline(t, handler("cancel-test", cfg), rec)
 
 	if got, want := rec.Code, http.StatusBadGateway; got != want {
 		t.Errorf("status: got %d, want %d", got, want)
@@ -644,6 +649,23 @@ func stubHTTPClient(t *testing.T, rt http.RoundTripper) {
 	original := httpClient
 	httpClient = &http.Client{Transport: rt}
 	t.Cleanup(func() { httpClient = original })
+}
+
+func serveHTTPWithinDeadline(t *testing.T, h http.Handler, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil).WithContext(ctx)
+		h.ServeHTTP(rec, req)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not complete within one second")
+	}
 }
 
 type trackingBody struct {
